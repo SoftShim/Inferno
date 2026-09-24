@@ -19,6 +19,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/arm/apple-silicon/dart.h"
 #include "block/aio.h"
 #include "hw/irq.h"
 #include "hw/misc/apple-silicon/a7iop/base.h"
@@ -203,6 +204,20 @@ void apple_a7iop_mailbox_update_irq(AppleA7IOPMailbox *s)
         s->iop_nonempty || s->iop_empty || s->ap_nonempty || s->ap_empty;
     sep_cpu_irq_raised |= !apple_mbox_interrupt_status_empty(s);
     if (!strcmp(s->role, "SEP-iop")) {
+        if (getenv("INFERNO_SEP_PS_TRACE") != NULL) {
+            static int last = -1;
+            if ((int)sep_cpu_irq_raised != last) {
+                last = sep_cpu_irq_raised;
+                fprintf(stderr,
+                        "SEP_PS: sep_cpu_irq -> %d (iop_nonempty=%d "
+                        "iop_empty=%d ap_nonempty=%d ap_empty=%d "
+                        "status_pending=%d sepd_enabled=%d connected=%d)\n",
+                        sep_cpu_irq_raised, s->iop_nonempty, s->iop_empty,
+                        s->ap_nonempty, s->ap_empty,
+                        !apple_mbox_interrupt_status_empty(s),
+                        s->sepd_enabled, s->sep_cpu_irq != NULL);
+            }
+        }
         qemu_set_irq(s->sep_cpu_irq, sep_cpu_irq_raised);
     }
     smp_mb();
@@ -223,10 +238,53 @@ static void apple_a7iop_mailbox_send(AppleA7IOPMailbox *s,
 {
     assert_nonnull(msg);
 
+    /*
+     * A message the AP sends to the SEP normally refers to a buffer it has just
+     * mapped into the SEP's DART. Under HVF those mappings only become visible
+     * to the SEP once they are mirrored into the global address space, and the
+     * mirror's timer is far too slow to win that race: measured on the keystore
+     * endpoint, the first six commands after it came up were answered -13 and
+     * the seventh succeeded, with nothing changing in between except the mirror
+     * catching up. Republish before the message is delivered.
+     *
+     * Deliberately outside the lock below, and only for the SEP's own mailbox.
+     */
+    if (s->role != NULL && strncmp(s->role, "SEP-", 4) == 0) {
+        apple_dart_hvf_mirror_refresh_all();
+    }
+
     QEMU_LOCK_GUARD(&s->lock);
 
     trace_apple_a7iop_mailbox_send(s->role, ldq_le_p(msg->data),
                                    ldq_le_p(msg->data + sizeof(uint64_t)));
+
+    /*
+     * Diagnostic: put SEP message boundaries into the *same* stream as sep.c's
+     * DPRINTFs (stderr), so MMIO can be attributed to the request that caused
+     * it. The QEMU trace backend writes to its own -D file, which cannot be
+     * interleaved with stderr. INFERNO_SEP_MSG_TRACE=1.
+     */
+    if (getenv("INFERNO_SEP_MSG_TRACE") != NULL && s->role != NULL &&
+        strncmp(s->role, "SEP-", 4) == 0) {
+        uint64_t q0 = ldq_le_p(msg->data);
+
+        /*
+         * Field names follow the on-the-wire SEP message, not the guesses this
+         * trace originally printed:
+         *   byte0 ep, byte1 tag, byte2 op, byte3 id, bytes4-7 data
+         * `id` is the endpoint a control op refers to, and for the OOL setup
+         * ops (2/3/4/5) `data` is a page number, so the buffer address is
+         * data << 12. Labelling byte2 "tag" and byte3 "status" is what made the
+         * control traffic look meaningless. (ep 0xfe is an L4Info message,
+         * where bytes 2-3 are instead a u16 size.)
+         */
+        fprintf(stderr,
+                "SEP_MSG: %s ep=0x%02x tag=0x%02x op=0x%02x id=0x%02x "
+                "data=0x%08x\n",
+                strcmp(s->role, "SEP-iop") == 0 ? "AP->SEP" : "SEP->AP",
+                (uint8_t)q0, (uint8_t)(q0 >> 8), (uint8_t)(q0 >> 16),
+                (uint8_t)(q0 >> 24), (uint32_t)(q0 >> 32));
+    }
 
     QTAILQ_INSERT_TAIL(&s->inbox, msg, next);
     s->count++;

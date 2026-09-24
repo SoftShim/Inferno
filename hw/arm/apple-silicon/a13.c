@@ -136,6 +136,30 @@ void apple_a13_set_on(AppleA13State *acpu)
 
     if (apple_a13_is_off(acpu)) {
         ret = arm_set_cpu_on_and_reset(acpu->parent_obj.mp_affinity);
+        /*
+         * arm_set_cpu_on_and_reset() only *queues* the reset on the target
+         * vCPU, and it queues a full cpu_reset(). power_state stays PSCI_OFF
+         * until that work runs, so a burst of writes all see apple_a13_is_off()
+         * and each queues another reset.
+         *
+         * The AP does exactly that: bringing SEP up is three back-to-back PMGR
+         * SEP_PS writes (0x0, 0xff, 0x100000ff), which queued three
+         * cpu_reset()s on the SEP core -- landing at arbitrary points *while
+         * SEPROM was already executing* and wiping its system registers
+         * underneath it.
+         *
+         * (This was found while chasing SEPROM's boot failure. It was not the
+         * cause of that -- see the CNTP_CTL_EL0 note in target/arm/hvf/hvf.c --
+         * but resetting a running core three times is a real hazard on its own.)
+         *
+         * Publish PSCI_ON_PENDING now. arm_set_cpu_on_and_reset() early-outs on
+         * it, so the follow-up writes become no-ops, and the queued work sets
+         * PSCI_ON. Unlike publishing PSCI_ON here, this cannot let the core
+         * execute from a stale PC: it is still halted until its reset work runs.
+         */
+        if (ret == QEMU_ARM_POWERCTL_RET_SUCCESS) {
+            acpu->parent_obj.power_state = PSCI_ON_PENDING;
+        }
     }
 
     if (ret != QEMU_ARM_POWERCTL_RET_SUCCESS) {
@@ -149,6 +173,23 @@ void apple_a13_reset(AppleA13State *acpu)
 
     if (!apple_a13_is_off(acpu)) {
         ret = arm_reset_cpu(acpu->parent_obj.mp_affinity);
+        /*
+         * arm_reset_cpu() only *queues* the reset on the target vCPU, but
+         * power_state is read synchronously by apple_a13_set_on(). The AP
+         * restarts SEP with a back-to-back PMGR SEP_PS pair (reset, then on);
+         * without this the "on" write still sees PSCI_ON, is dropped as
+         * "already on", and the queued reset then parks the core for good --
+         * which is what makes a restore's RSEP boot hang at stage 1.
+         *
+         * Publish the OFF state now. The queued cpu_reset() sets it again
+         * (the core is start-powered-off), so this is idempotent, and work
+         * queued afterwards by arm_set_cpu_on_and_reset() runs after the
+         * reset because per-vCPU work is FIFO.
+         *
+         * Only safe in the OFF direction: publishing PSCI_ON early would let
+         * the core execute from a stale PC before its reset work has run.
+         */
+        acpu->parent_obj.power_state = PSCI_OFF;
     }
 
     if (ret != QEMU_ARM_POWERCTL_RET_SUCCESS) {
@@ -163,6 +204,8 @@ void apple_a13_set_off(AppleA13State *acpu)
 
     if (acpu->parent_obj.power_state != PSCI_OFF) {
         ret = arm_set_cpu_off(acpu->parent_obj.mp_affinity);
+        /* Same async/sync mismatch as apple_a13_reset(). */
+        acpu->parent_obj.power_state = PSCI_OFF;
     }
 
     if (ret != QEMU_ARM_POWERCTL_RET_SUCCESS) {

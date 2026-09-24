@@ -41,6 +41,10 @@
 #include "gdbstub/enums.h"
 
 #include "emulate/aarch64.h"
+#include "hw/arm/apple-silicon/gxf-hvf.h"
+
+static void hvf_save_sp(CPUARMState *env);
+static void hvf_restore_sp(CPUARMState *env);
 
 #define MDSCR_EL1_SS_SHIFT  0
 #define MDSCR_EL1_MDE_SHIFT 15
@@ -562,7 +566,7 @@ int hvf_arch_get_registers(CPUState *cpu)
     }
     assert(write_list_to_cpustate(arm_cpu));
 
-    aarch64_restore_sp(env, arm_current_el(env));
+    hvf_restore_sp(env);
 
     return 0;
 }
@@ -599,7 +603,7 @@ int hvf_arch_put_registers(CPUState *cpu)
     ret = hv_vcpu_set_reg(cpu->accel->fd, HV_REG_CPSR, pstate_read(env));
     assert_hvf_ok(ret);
 
-    aarch64_save_sp(env, arm_current_el(env));
+    hvf_save_sp(env);
 
     assert(write_cpustate_to_list(arm_cpu, false));
     for (i = 0, n = arm_cpu->cpreg_array_len; i < n; i++) {
@@ -986,17 +990,959 @@ void hvf_kick_vcpu_thread(CPUState *cpu)
     assert_hvf_ok(ret);
 }
 
+/*
+ * SP_EL0/SP_EL1 <-> xregs[31] helpers. The generic aarch64_save_sp() and
+ * aarch64_restore_sp() redirect SP_EL1 to gxf.sp_gl[] while guarded (TCG's
+ * banking); under HVF the vCPU's SP_EL1 is always the live one, so use
+ * plain variants everywhere in this file.
+ */
+static void hvf_save_sp(CPUARMState *env)
+{
+    if (env->pstate & PSTATE_SP) {
+        env->sp_el[arm_current_el(env)] = env->xregs[31];
+    } else {
+        env->sp_el[0] = env->xregs[31];
+    }
+}
+
+static void hvf_restore_sp(CPUARMState *env)
+{
+    if (env->pstate & PSTATE_SP) {
+        env->xregs[31] = env->sp_el[arm_current_el(env)];
+    } else {
+        env->xregs[31] = env->sp_el[0];
+    }
+}
+
+/*
+ * Apple GXF (Guarded Execution) emulation.
+ *
+ * Hypervisor.framework does not virtualise GXF. The kernel patcher rewrites
+ * GENTER/GEXIT into HVC #GXF_HVC_IMM_GENTER / #GXF_HVC_IMM_GEXIT, and we
+ * emulate the GL1 register bank here. While the guest is in GL1, the GL1
+ * bank (VBAR/TPIDR/SPSR/ELR/ESR/FAR) is made live in the real EL1 registers
+ * so that hardware exception entry/return inside GL1 behaves like on real
+ * silicon (vectors through VBAR_GL1, saves into SPSR/ELR/ESR/FAR_GL1). The
+ * EL1 bank is stashed in cpu->accel->gxf_el1_saved meanwhile.
+ *
+ * All of these operate on the QEMU-side env; callers must have done
+ * cpu_synchronize_state() and must leave cpu->vcpu_dirty set.
+ */
+static bool hvf_gxf_defer_irq(void);
+static unsigned hvf_sprr_prot_guarded(unsigned nibble);
+static unsigned hvf_sprr_prot_plain(unsigned nibble);
+static unsigned hvf_sprr_permissive_class(CPUARMState *env, unsigned cls);
+
+/*
+ * Per-vCPU event ring, recorded only when INFERNO_HVF_HANG_WATCH is set and
+ * dumped by the hang watchdog. A wedge leaves the vCPU spinning inside the
+ * guest with no exit, so the only way to tell *which* exception got into
+ * guarded mode is to keep a log of what we did just before.
+ */
+enum {
+    HVF_EV_GENTER = 1, HVF_EV_GEXIT, HVF_EV_IRQ_ARM, HVF_EV_FIQ_ARM,
+    HVF_EV_WITHDRAW, HVF_EV_VT_MASK, HVF_EV_VT_UNMASK, HVF_EV_VT_ACTIVE,
+    HVF_EV_RAISE, HVF_EV_EXIT,
+};
+
+static const char *hvf_ev_names[] = {
+    "-", "genter", "gexit", "irq-arm", "fiq-arm", "withdraw",
+    "vt-mask", "vt-unmask", "vt-active", "raise", "exit",
+};
+
+static bool hvf_ev_on;
+
+static void hvf_ev(CPUState *cpu, unsigned kind, uint64_t aux)
+{
+    AccelCPUState *acc = cpu->accel;
+    unsigned i;
+
+    if (!hvf_ev_on) {
+        return;
+    }
+    /*
+     * Run-length encode. Once a vCPU is wedged, QEMU is kicked and withdraws
+     * the same interrupt at the same PC thousands of times, which otherwise
+     * flushes the history that actually explains how it got there.
+     */
+    if (acc->ev_head) {
+        i = (acc->ev_head - 1) % HVF_EV_RING;
+        if (acc->ev[i].kind == kind && acc->ev[i].pc == cpu_env(cpu)->pc &&
+            acc->ev[i].aux == aux) {
+            acc->ev[i].rep++;
+            return;
+        }
+    }
+    i = acc->ev_head++ % HVF_EV_RING;
+    acc->ev[i].kind = kind;
+    acc->ev[i].pc = cpu_env(cpu)->pc;
+    acc->ev[i].aux = aux;
+    acc->ev[i].rep = 1;
+}
+
+static void hvf_ev_dump(CPUState *cpu)
+{
+    AccelCPUState *acc = cpu->accel;
+    unsigned n = MIN(acc->ev_head, HVF_EV_RING);
+    unsigned i;
+
+    if (!hvf_ev_on || n == 0) {
+        return;
+    }
+    fprintf(stderr, "  events (oldest first, %u of %" PRIu64 "):\n", n,
+            acc->ev_head);
+    for (i = 0; i < n; i++) {
+        unsigned k = (acc->ev_head - n + i) % HVF_EV_RING;
+        unsigned kind = acc->ev[k].kind;
+
+        fprintf(stderr, "    %-9s x%-7u pc=%#018" PRIx64 " aux=%#" PRIx64
+                "\n",
+                kind < ARRAY_SIZE(hvf_ev_names) ? hvf_ev_names[kind] : "?",
+                acc->ev[k].rep, acc->ev[k].pc, acc->ev[k].aux);
+    }
+}
+
+#define HVF_SPRR_RELAX_INTERVAL 50000
+
+static bool hvf_sprr_relax_all_enabled(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("INFERNO_HVF_SPRR_RELAX_ALL");
+        on = e != NULL && atoi(e) != 0;
+    }
+    return on;
+}
+
+/*
+ * Walk the guest's TTBR1 stage-1 tables and return the address of the leaf
+ * descriptor for `va`, or 0 if the walk does not reach one.
+ */
+static uint64_t hvf_s1_leaf_addr(CPUARMState *env, uint64_t va, uint64_t *out)
+{
+    uint64_t tcr = env->cp15.tcr_el[1];
+    unsigned tg1 = extract64(tcr, 30, 2);
+    unsigned t1sz = extract64(tcr, 16, 6);
+    unsigned page_bits, stride, va_bits, bits;
+    uint64_t pa, desc = 0, entry = 0;
+    int level;
+
+    switch (tg1) {
+    case 1: page_bits = 14; break;
+    case 2: page_bits = 12; break;
+    case 3: page_bits = 16; break;
+    default: return 0;
+    }
+    stride = page_bits - 3;
+    va_bits = 64 - t1sz;
+    level = 3;
+    bits = page_bits;
+    while (bits + stride < va_bits) {
+        bits += stride;
+        level--;
+    }
+
+    pa = env->cp15.ttbr1_el[1] & MAKE_64BIT_MASK(1, 47);
+    for (; level <= 3; level++) {
+        unsigned shift = page_bits + stride * (3 - level);
+        unsigned idx_bits = (level == 3) ? stride :
+                            MIN(stride, va_bits - shift);
+
+        entry = pa + extract64(va, shift, idx_bits) * 8;
+        desc = address_space_ldq(&address_space_memory, entry,
+                                 MEMTXATTRS_UNSPECIFIED, NULL);
+        if (!(desc & 1)) {
+            return 0;
+        }
+        if (level < 3 && (desc & 3) == 1) {
+            break;              /* block */
+        }
+        if (level < 3) {
+            pa = desc & MAKE_64BIT_MASK(page_bits, 48 - page_bits);
+        }
+    }
+    *out = desc;
+    return entry;
+}
+
+/*
+ * Make the GL1 vector page executable outside guarded mode.
+ *
+ * XNU maps VBAR_GL1's page with AP=0, PXN=0, UXN=0. On Apple silicon that is
+ * not read as plain ARM permissions: it is SPRR class 0, and the guest's
+ * SPRR_PERM_EL1 gives that class "RX while guarded, R otherwise". The host CPU
+ * is never actually in GL1 -- GXF is emulated in software here -- so the page
+ * decodes as read-only and *any* exception taken while guarded faults trying
+ * to fetch its own vector, then vectors to the same page and faults again. The
+ * vCPU spins on that at 100% with no exit to the hypervisor and the boot stops
+ * dead. It cost roughly a third of all boots.
+ *
+ * Re-tag the page as class 0xA (AP=2, UXN=1, PXN=0), which is what ordinary
+ * kernel text uses and which SPRR maps to RX in both modes. The page is never
+ * written, so nothing is lost. Done once, when the guest installs VBAR_GL1,
+ * which is long before anything fetches from it, so no stale TLB entry can
+ * shadow the change.
+ *
+ * Only this one page. Re-tagging further guarded-only pages was measured and
+ * is worse, not better: doing the guarded stack too went 15/16 -> 12/17, and
+ * relaxing every class 1 (PPL data) mapping went to 0/12, mostly fast kernel
+ * panics -- PPL validates its own mappings. Going further means the guarded
+ * exception is actually delivered, and then XNU's stack-bounds check in the
+ * normal EL1 vector spins on `b.lt .` instead, because the GEXIT hand-off
+ * leaves SP_EL1 pointing at the guarded stack. That needs the GXF emulation
+ * to model exception entry/return in GL1 properly, which is a bigger job.
+ * INFERNO_HVF_SPRR_RELAX_ALL=1 enables the whole-table pass for experiments.
+ */
+/*
+ * Relax every "guarded-only" SPRR class in the kernel's TTBR1 mappings.
+ *
+ * Apple silicon does not read a PTE's AP/PXN/UXN bits directly: they form a
+ * 4-bit index into SPRR_PERM_EL1, and each entry encodes *two* permissions --
+ * one for guarded (GL1) execution and one for everything else. XNU gives PPL
+ * its isolation that way: class 0 is "RX guarded, R otherwise" (the GL1
+ * vectors and PPL text) and class 1 is "RW guarded, R otherwise" (PPL stacks
+ * and data).
+ *
+ * We emulate GXF in software, so the host CPU is never actually in GL1 and
+ * always decodes the "otherwise" half. Everything PPL does while QEMU thinks
+ * it is guarded therefore faults, and because the fault vectors through
+ * VBAR_GL1 -- itself a class 0 page -- the abort re-faults on its own vector
+ * and the vCPU spins there at 100% with no exit to the hypervisor. That is
+ * what stopped roughly a third of boots dead.
+ *
+ * Re-tag those two classes to equivalents that grant the same access in both
+ * halves: class 0 -> 0xA ("RX" both, what ordinary kernel text uses) and
+ * class 1 -> 3 ("RW" both). This gives up PPL's hardware isolation, which
+ * buys nothing here -- the kernel patcher already disables hardware TPRO and
+ * pmap_cs for the same reason.
+ */
+/* Bitmap of classes whose non-guarded half no longer covers their guarded one. */
+static unsigned hvf_sprr_guarded_only_classes(uint64_t perm)
+{
+    unsigned mask = 0;
+    unsigned i;
+
+    for (i = 0; i < 16; i++) {
+        unsigned nibble = (perm >> (4 * i)) & 0xf;
+        unsigned want = hvf_sprr_prot_guarded(nibble);
+
+        if ((hvf_sprr_prot_plain(nibble) & want) != want) {
+            mask |= 1u << i;
+        }
+    }
+    return mask;
+}
+
+static unsigned hvf_sprr_relax_mask;
+
+static bool hvf_sprr_relax_leaf(uint64_t *desc)
+{
+    unsigned ap = extract64(*desc, 6, 2);
+    unsigned pxn = extract64(*desc, 53, 1);
+    unsigned uxn = extract64(*desc, 54, 1);
+    unsigned idx = (ap << 2) | (uxn << 1) | pxn;
+    unsigned repl;
+
+    /*
+     * Re-tag only the classes that the kernel's SPRR_PERM_EL1 write just made
+     * guarded-only, to the equivalent that grants the same outside GL1.
+     */
+    if (!(hvf_sprr_relax_mask & (1u << idx))) {
+        return false;
+    }
+    repl = hvf_sprr_permissive_class(&ARM_CPU(first_cpu)->env, idx);
+    if (repl == idx) {
+        return false;
+    }
+    *desc = deposit64(*desc, 6, 2, (repl >> 2) & 3);
+    *desc = deposit64(*desc, 53, 1, repl & 1);
+    *desc = deposit64(*desc, 54, 1, (repl >> 1) & 1);
+    return true;
+}
+
+static void hvf_sprr_relax_all(CPUState *cpu)
+{
+    CPUARMState *env = &ARM_CPU(cpu)->env;
+    uint64_t tcr = env->cp15.tcr_el[1];
+    unsigned tg1 = extract64(tcr, 30, 2);
+    unsigned t1sz = extract64(tcr, 16, 6);
+    unsigned page_bits, stride, va_bits, bits, top_bits;
+    uint64_t l1, changed = 0, leaves = 0;
+    int level;
+    unsigned i, j, k;
+
+    switch (tg1) {
+    case 1: page_bits = 14; break;
+    case 2: page_bits = 12; break;
+    case 3: page_bits = 16; break;
+    default: return;
+    }
+    stride = page_bits - 3;
+    va_bits = 64 - t1sz;
+    level = 3;
+    bits = page_bits;
+    while (bits + stride < va_bits) {
+        bits += stride;
+        level--;
+    }
+    if (level != 1) {
+        /* Only the 3-level layout the t8030 guest actually uses. */
+        return;
+    }
+    top_bits = va_bits - bits;
+    l1 = env->cp15.ttbr1_el[1] & MAKE_64BIT_MASK(1, 47);
+
+    for (i = 0; i < (1u << top_bits); i++) {
+        uint64_t d1 = address_space_ldq(&address_space_memory, l1 + i * 8,
+                                        MEMTXATTRS_UNSPECIFIED, NULL);
+        uint64_t l2;
+
+        if ((d1 & 3) != 3) {
+            continue;
+        }
+        l2 = d1 & MAKE_64BIT_MASK(page_bits, 48 - page_bits);
+        for (j = 0; j < (1u << stride); j++) {
+            uint64_t d2 = address_space_ldq(&address_space_memory, l2 + j * 8,
+                                            MEMTXATTRS_UNSPECIFIED, NULL);
+            uint64_t l3;
+
+            if ((d2 & 3) != 3) {
+                continue;
+            }
+            l3 = d2 & MAKE_64BIT_MASK(page_bits, 48 - page_bits);
+            for (k = 0; k < (1u << stride); k++) {
+                uint64_t addr = l3 + k * 8;
+                uint64_t d3 = address_space_ldq(&address_space_memory, addr,
+                                                MEMTXATTRS_UNSPECIFIED, NULL);
+
+                if ((d3 & 3) != 3) {
+                    continue;
+                }
+                leaves++;
+                if (hvf_sprr_relax_leaf(&d3)) {
+                    address_space_stq(&address_space_memory, addr, d3,
+                                      MEMTXATTRS_UNSPECIFIED, NULL);
+                    changed++;
+                }
+            }
+        }
+    }
+
+    if (changed) {
+        info_report("GXF/HVF: relaxed %" PRIu64 " of %" PRIu64
+                    " guarded-only PPL data mappings", changed, leaves);
+    }
+}
+
+/*
+ * Re-tag one page so that the class it decodes to outside guarded mode grants
+ * what it grants inside. Returns true if the descriptor was changed.
+ *
+ *   class 0 (AP=0,UXN=0,PXN=0): RX guarded, R otherwise  -> class 0xA, RX both
+ *   class 1 (AP=0,UXN=0,PXN=1): RW guarded, R otherwise  -> class 3,   RW both
+ *
+ * Anything else already grants the same in both halves and is left alone --
+ * which matters, because XNU's pmap_set_pte_xprr_perm() asserts a PTE's
+ * current class before re-permissioning it and panics on a mismatch
+ * ("perm=3 does not match expected_perm"). Only pages PPL never re-permissions
+ * are safe to touch, which is why this is driven off the GL1 vector page's own
+ * references rather than applied to the whole table.
+ */
+static bool hvf_gxf_retag_page(CPUState *cpu, uint64_t va, const char *what)
+{
+    CPUARMState *env = &ARM_CPU(cpu)->env;
+    uint64_t desc = 0, entry;
+    unsigned idx;
+
+    if (va == 0) {
+        return false;
+    }
+    entry = hvf_s1_leaf_addr(env, va, &desc);
+    if (entry == 0) {
+        return false;
+    }
+    idx = (extract64(desc, 6, 2) << 2) | (extract64(desc, 54, 1) << 1) |
+          extract64(desc, 53, 1);
+    if (idx == 0) {
+        desc = deposit64(desc, 6, 2, 2);    /* AP  = 2 */
+        desc = deposit64(desc, 54, 1, 1);   /* UXN = 1 */
+    } else if (idx == 1) {
+        desc = deposit64(desc, 54, 1, 1);   /* UXN = 1 */
+    } else {
+        return false;
+    }
+    address_space_stq(&address_space_memory, entry, desc,
+                      MEMTXATTRS_UNSPECIFIED, NULL);
+    info_report("GXF/HVF: re-tagged %s %#" PRIx64 " (class %u, pte@%#" PRIx64
+                " -> %#" PRIx64 ")", what, va, idx, entry, desc);
+    return true;
+}
+
+/*
+ * Walk the GL1 vector page's instructions and re-tag every page its PC-relative
+ * references reach. The handler reads a per-CPU array through an ADRP/ADD pair
+ * before it has left guarded mode, and that array is class 1, so without this
+ * the very first load after the exception faults just as the vector fetch did.
+ */
+static void hvf_gxf_fixup_vector_refs(CPUState *cpu, uint64_t vbar)
+{
+    uint64_t seen[8] = { 0 };
+    unsigned n_seen = 0;
+    unsigned i;
+
+    for (i = 0; i < 0x4000 / 4; i++) {
+        uint64_t pc = vbar + i * 4;
+        uint32_t insn;
+        uint64_t target, page;
+
+        if (cpu_memory_rw_debug(cpu, pc, (uint8_t *)&insn, 4, 0)) {
+            return;
+        }
+        insn = le32_to_cpu(insn);
+        unsigned rd, j;
+        bool dup = false;
+
+        /* ADRP: op=1, 1 0000 -> bits 31 and 28..24 */
+        if ((insn & 0x9f000000) != 0x90000000) {
+            continue;
+        }
+        rd = insn & 0x1f;
+        target = (pc & ~(uint64_t)0xfff) +
+                 (sextract64(((insn >> 5) & 0x7ffff) << 2 |
+                             ((insn >> 29) & 3), 0, 21) << 12);
+
+        /* Fold in a following "ADD Xd, Xd, #imm" so the datum is covered. */
+        if (i + 1 < 0x4000 / 4) {
+            uint32_t next = 0;
+
+            if (cpu_memory_rw_debug(cpu, pc + 4, (uint8_t *)&next, 4, 0)) {
+                next = 0;
+            }
+            next = le32_to_cpu(next);
+            if ((next & 0xffc00000) == 0x91000000 &&
+                (next & 0x1f) == rd && ((next >> 5) & 0x1f) == rd) {
+                target += (next >> 10) & 0xfff;
+            }
+        }
+
+        page = target & ~(uint64_t)0x3fff;
+        for (j = 0; j < n_seen; j++) {
+            if (seen[j] == page) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) {
+            continue;
+        }
+        if (n_seen < ARRAY_SIZE(seen)) {
+            seen[n_seen++] = page;
+        }
+        hvf_gxf_retag_page(cpu, target, "GL1 vector reference");
+    }
+}
+
+/*
+ * Force the guest's TLBs to be invalidated.
+ *
+ * Re-tagging a PTE is not enough on its own: the class bits are cached in the
+ * TLB, and Apple reports an access that violates the cached class as a data
+ * abort with an IMPDEF fault status (0x21, which reads as "alignment fault"
+ * architecturally but is raised here for an access that is properly aligned on
+ * Normal write-back memory with SCTLR_EL1.A clear). HVF exposes no TLBI, but
+ * it must invalidate the combined stage-1/stage-2 entries for a region when
+ * its stage-2 permissions change, so cycling them does the job.
+ *
+ * Must run with the other vCPUs stopped -- see hvf_sprr_relax_work().
+ */
+static void hvf_flush_guest_tlb(void)
+{
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(hvf_state->slots); i++) {
+        hvf_slot *slot = &hvf_state->slots[i];
+
+        if (slot->size == 0 || slot->mem == NULL) {
+            continue;
+        }
+        hv_vm_protect(slot->start, slot->size,
+                      HV_MEMORY_READ | HV_MEMORY_EXEC);
+        hv_vm_protect(slot->start, slot->size,
+                      HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
+    }
+}
+
+static void hvf_sprr_relax_work(CPUState *cpu, run_on_cpu_data data)
+{
+    hvf_sprr_relax_mask = data.host_int;
+    hvf_sprr_relax_all(cpu);
+    hvf_flush_guest_tlb();
+}
+
+static void hvf_gxf_fixup_vectors(CPUState *cpu, uint64_t vbar)
+{
+    if (!hvf_gxf_defer_irq() || vbar == 0 ||
+        vbar == cpu->accel->gxf_vbar_fixed) {
+        return;
+    }
+    cpu->accel->gxf_vbar_fixed = vbar;
+    hvf_gxf_retag_page(cpu, vbar, "VBAR_GL1 page");
+    /*
+     * Re-tagging the pages the vector code references (the per-CPU PPL array)
+     * as well was measured at 15/19, against 36/40 for the vector page alone,
+     * and the failures relocate rather than disappear -- so the scan is kept
+     * behind a switch rather than run by default.
+     */
+    if (getenv("INFERNO_HVF_GXF_RETAG_REFS")) {
+        hvf_gxf_fixup_vector_refs(cpu, vbar);
+    }
+}
+
+/*
+ * Apple XPRR/SPRR permission classes.
+ *
+ * A PTE's AP[7:6] and PXN/UXN[53:54] form a 4-bit index into SPRR_PERM_EL1,
+ * and each 4-bit entry holds *two* permissions: bits [3:2] apply while the CPU
+ * is in guarded state (GL1), bits [1:0] the rest of the time. XNU isolates PPL
+ * with classes whose two halves differ -- PPL text reads "RX guarded, R
+ * otherwise", PPL data "RW guarded, nothing otherwise".
+ *
+ * We emulate GXF in software, so the host CPU never actually enters GL1 and
+ * always decodes the second half. Everything PPL touches while QEMU believes
+ * it is guarded therefore faults. The decode below mirrors
+ * pte_to_sprr_prot_is_guarded() in target/arm/ptw.c, which is what TCG uses --
+ * and is why none of this is needed there.
+ */
+#define SPRR_P_R 1
+#define SPRR_P_W 2
+#define SPRR_P_X 4
+
+static unsigned hvf_sprr_prot_guarded(unsigned nibble)
+{
+    switch (nibble >> 2) {
+    case 0:  return 0;
+    case 1:  return SPRR_P_R | SPRR_P_X;
+    case 2:  return SPRR_P_R;
+    default: return SPRR_P_R | SPRR_P_W;
+    }
+}
+
+static unsigned hvf_sprr_prot_plain(unsigned nibble)
+{
+    unsigned guarded = nibble >> 2;
+
+    switch (nibble & 3) {
+    case 0:  return 0;
+    case 1:  return guarded == 2 ? SPRR_P_X : (SPRR_P_R | SPRR_P_X);
+    case 2:  return SPRR_P_R;
+    default: return guarded == 1 ? 0 : (SPRR_P_R | SPRR_P_W);
+    }
+}
+
+/*
+ * Given the class the kernel wants to install, return one that grants at least
+ * as much *outside* guarded mode as the requested one grants inside it.
+ *
+ * Derived from the guest's own SPRR_PERM_EL1 rather than hardcoded, so it is
+ * not tied to one kernel's class numbering. Classes whose two halves are equal
+ * are preferred: those are what the kernel uses for ordinary text and data, so
+ * they are known to decode sanely under whatever permission table the host has
+ * programmed -- which is not necessarily the guest's, since HVF exposes no way
+ * to write the Apple IMPDEF SPRR registers.
+ */
+static unsigned hvf_sprr_permissive_class(CPUARMState *env, unsigned cls)
+{
+    uint64_t perm = env->sprr.sprr_el_br_el1[1][1];
+    unsigned nibble = (perm >> (4 * (cls & 0xf))) & 0xf;
+    unsigned want = hvf_sprr_prot_guarded(nibble) | hvf_sprr_prot_plain(nibble);
+    unsigned i;
+
+    if ((hvf_sprr_prot_plain(nibble) & want) == want) {
+        return cls;             /* already permissive enough */
+    }
+    for (i = 0; i < 16; i++) {
+        unsigned c = (perm >> (4 * i)) & 0xf;
+
+        if ((c >> 2) == (c & 3) &&
+            (hvf_sprr_prot_plain(c) & want) == want) {
+            return i;
+        }
+    }
+    return cls;                 /* nothing better available */
+}
+
+/*
+ * Emulate pmap_set_pte_xprr_perm(ptep, expected_perm, new_perm).
+ *
+ * The kernel patcher replaced the function's first instruction with an HVC, so
+ * the whole thing happens here: we write the PTE ourselves, substituting a
+ * class that is usable outside guarded mode. QEMU's writes go through the
+ * software page-table walk and bypass SPRR entirely, which is the point -- the
+ * guest cannot make this change itself, because the moment a page carries a
+ * PPL-only class the guest can no longer touch it.
+ *
+ * The function's own assertion that the PTE currently holds `expected_perm` is
+ * dropped: once a class has been substituted it will not match what the kernel
+ * remembers, and the panic it raises ("perm=%llu does not match
+ * expected_perm") is exactly what made a blanket page-table rewrite unusable.
+ */
+static void hvf_xprr_set_pte(CPUState *cpu)
+{
+    CPUARMState *env = &ARM_CPU(cpu)->env;
+    uint64_t ptep = env->xregs[0];
+    unsigned want = env->xregs[2] & 0xf;
+    uint64_t pte = 0;
+    unsigned repl;
+
+    if (cpu_memory_rw_debug(cpu, ptep, (uint8_t *)&pte, sizeof(pte), 0) == 0) {
+        pte = le64_to_cpu(pte);
+        repl = hvf_sprr_permissive_class(env, want);
+        if (getenv("INFERNO_HVF_XPRR_TRACE")) {
+            static uint64_t calls, remapped;
+            static uint64_t last_perm = ~0ULL;
+            uint64_t perm = env->sprr.sprr_el_br_el1[1][1];
+
+            static uint32_t seen_want;
+
+            calls++;
+            remapped += (repl != want);
+            if (!(seen_want & (1u << want))) {
+                seen_want |= 1u << want;
+                fprintf(stderr, "xprr: first request for class %u -> %u "
+                        "(sprr=%#" PRIx64 ")\n", want, repl, perm);
+            }
+            if (perm != last_perm || calls % 5000 == 0) {
+                last_perm = perm;
+                fprintf(stderr, "xprr: calls=%" PRIu64 " remapped=%" PRIu64
+                        " sprr=%#" PRIx64 " want=%u -> %u\n",
+                        calls, remapped, perm, want, repl);
+            }
+        }
+        pte &= 0xFF9FFFFFFFFFFF3FULL;
+        pte |= ((uint64_t)(repl & 0xc) << 4) | ((uint64_t)(repl & 3) << 53);
+        pte = cpu_to_le64(pte);
+        cpu_memory_rw_debug(cpu, ptep, (uint8_t *)&pte, sizeof(pte), 1);
+    }
+
+    /*
+     * Return to the caller. The replaced instruction was the PACIBSP at the
+     * top of the function, so the matching RETAB never runs either and x30
+     * still holds the unsigned return address.
+     */
+    env->pc = env->xregs[30];
+}
+
+static bool hvf_gxf_is_guarded(CPUARMState *env)
+{
+    return arm_feature(env, ARM_FEATURE_GXF) &&
+           (env->gxf.gxf_status_el[1] & 1);
+}
+
+/* Copy the live EL1 registers (== GL1 bank while guarded) into gxf.*_gl. */
+static void hvf_gxf_sync_live_to_gl(CPUARMState *env)
+{
+    env->gxf.vbar_gl[1] = env->cp15.vbar_el[1];
+    env->gxf.tpidr_gl[1] = env->cp15.tpidr_el[1];
+    env->gxf.spsr_gl[1] = env->banked_spsr[BANK_SVC];
+    env->gxf.elr_gl[1] = env->elr_el[1];
+    env->gxf.esr_gl[1] = env->cp15.esr_el[1];
+    env->gxf.far_gl[1] = env->cp15.far_el[1];
+    env->gxf.sp_gl[1] = env->sp_el[1];
+}
+
+/* Make gxf.*_gl live in the real EL1 registers. */
+static void hvf_gxf_sync_gl_to_live(CPUARMState *env)
+{
+    env->cp15.vbar_el[1] = env->gxf.vbar_gl[1];
+    env->cp15.tpidr_el[1] = env->gxf.tpidr_gl[1];
+    env->banked_spsr[BANK_SVC] = env->gxf.spsr_gl[1];
+    env->elr_el[1] = env->gxf.elr_gl[1];
+    env->cp15.esr_el[1] = env->gxf.esr_gl[1];
+    env->cp15.far_el[1] = env->gxf.far_gl[1];
+    env->sp_el[1] = env->gxf.sp_gl[1];
+}
+
+static bool hvf_trace_exceptions(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("INFERNO_HVF_TRACE_EXC") != NULL;
+    }
+    return on;
+}
+
 static void hvf_raise_exception(CPUState *cpu, uint32_t excp,
                                 uint32_t syndrome, int target_el)
 {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
     CPUARMState *env = &arm_cpu->env;
+    bool guarded = hvf_gxf_is_guarded(env);
 
     cpu->exception_index = excp;
     env->exception.target_el = target_el;
     env->exception.syndrome = syndrome;
 
+    /*
+     * Every synthetic exception QEMU injects goes through here. When one is
+     * delivered while the guest is in guarded mode and already on SP_EL1, XNU
+     * vectors it to the "Current EL with SPx" entry of VBAR_GL1, which is an
+     * unconditional `B .` -- the vCPU then spins at 100% forever and the boot
+     * wedges with no further serial output. INFERNO_HVF_TRACE_EXC prints the
+     * cause so that hang can be attributed.
+     */
+    hvf_ev(cpu, HVF_EV_RAISE, ((uint64_t)excp << 32) | syndrome);
+    if (hvf_trace_exceptions()) {
+        fprintf(stderr, "hvf-exc: cpu%d excp=%u syn=%#010x target_el=%d "
+                "pc=%#018" PRIx64 " guarded=%d spsel=%d\n",
+                cpu->cpu_index, excp, syndrome, target_el, env->pc,
+                (int)guarded, (int)!!(env->pstate & PSTATE_SP));
+    }
+
+    /*
+     * arm_cpu_do_interrupt() uses the gxf.*_gl shadow bank when guarded;
+     * keep it coherent with the live registers around the call.
+     */
+    if (guarded) {
+        hvf_gxf_sync_live_to_gl(env);
+    }
     arm_cpu_do_interrupt(cpu);
+    if (guarded) {
+        hvf_gxf_sync_gl_to_live(env);
+    }
+}
+
+static void hvf_gxf_enter(CPUState *cpu, uint32_t imm)
+{
+    ARMCPU *arm_cpu = ARM_CPU(cpu);
+    CPUARMState *env = &arm_cpu->env;
+    AccelCPUState *acc = cpu->accel;
+    uint32_t old_mode;
+    uint32_t new_mode;
+
+    if (!arm_feature(env, ARM_FEATURE_GXF) ||
+        !(env->gxf.gxf_config_el[1] & 1) || arm_current_el(env) != 1) {
+        trace_hvf_unknown_hvc(env->pc, env->xregs[0]);
+        hvf_raise_exception(cpu, EXCP_UDEF, syn_uncategorized(), 1);
+        return;
+    }
+
+    if (hvf_gxf_is_guarded(env)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: GENTER while already guarded\n",
+                      __func__);
+        hvf_raise_exception(cpu, EXCP_UDEF, syn_uncategorized(), 1);
+        return;
+    }
+
+    old_mode = pstate_read(env);
+    hvf_save_sp(env);
+
+    /* Stash the EL1 bank (SP_EL1 included: GL1 has its own SP1). */
+    acc->gxf_el1_saved.vbar = env->cp15.vbar_el[1];
+    acc->gxf_el1_saved.tpidr = env->cp15.tpidr_el[1];
+    acc->gxf_el1_saved.spsr = env->banked_spsr[BANK_SVC];
+    acc->gxf_el1_saved.elr = env->elr_el[1];
+    acc->gxf_el1_saved.esr = env->cp15.esr_el[1];
+    acc->gxf_el1_saved.far = env->cp15.far_el[1];
+    acc->gxf_el1_saved.sp_el1 = env->sp_el[1];
+
+    /* Build the GL1 bank. For HVC exits the PC already points past it. */
+    env->gxf.spsr_gl[1] = old_mode;
+    env->gxf.elr_gl[1] = env->pc;
+    env->gxf.esr_gl[1] = syn_aa64_genter(imm);
+    hvf_gxf_fixup_vectors(cpu, env->gxf.vbar_gl[1]);
+    /*
+     * PPL does not lock itself down by re-tagging pages -- it rewrites
+     * SPRR_PERM_EL1 so that classes which used to grant the same in both
+     * halves become guarded-only, retroactively taking away access to every
+     * page already tagged with them. Watch for that write (it happens once,
+     * and GENTER is the cheapest place to notice) and re-tag the affected
+     * pages to the equivalents that still grant the same outside GL1.
+     *
+     * Safe to do here only because pmap_set_pte_xprr_perm() is now emulated by
+     * hvf_xprr_set_pte(), which drops the assertion on a PTE's current class.
+     * Doing this walk without that is what panicked the guest with
+     * "perm=3 does not match expected_perm".
+     */
+    if (gxf_hvf_xprr_remap_enabled()) {
+        uint64_t perm = env->sprr.sprr_el_br_el1[1][1];
+
+        if (perm != cpu->accel->gxf_sprr_seen) {
+            unsigned mask = hvf_sprr_guarded_only_classes(perm);
+
+            cpu->accel->gxf_sprr_seen = perm;
+            if (mask != 0) {
+                /*
+                 * Defer to a safe point: the walk rewrites page tables the
+                 * other vCPUs are actively translating, and the TLB flush
+                 * that has to follow it cannot race them either. GENTER may
+                 * well be running on the lock-free path here.
+                 */
+                async_safe_run_on_cpu(cpu, hvf_sprr_relax_work,
+                                      RUN_ON_CPU_HOST_INT(mask));
+            }
+        }
+    }
+    hvf_gxf_sync_gl_to_live(env);
+
+    new_mode = PSTATE_MODE_EL1h;
+    if (cpu_isar_feature(aa64_pan, arm_cpu)) {
+        new_mode |= old_mode & PSTATE_PAN;
+        if ((env->cp15.sctlr_el[1] & SCTLR_SPAN) == 0) {
+            new_mode |= PSTATE_PAN;
+        }
+    }
+    if (cpu_isar_feature(aa64_ssbs, arm_cpu) &&
+        (env->cp15.sctlr_el[1] & SCTLR_DSSBS_64)) {
+        new_mode |= PSTATE_SSBS;
+    }
+    pstate_write(env, PSTATE_DAIF | new_mode);
+    env->gxf.gxf_status_el[1] |= 1;
+
+    /*
+     * Withdraw any interrupt HVF already has armed for this vCPU.
+     *
+     * hv_vcpu_set_pending_interrupt() is sticky, and GENTER is handled inside
+     * the lock-free loop in hvf_arch_vcpu_exec() which never revisits
+     * hvf_inject_interrupts(). Without this, an interrupt armed before the
+     * guest entered GL1 stays armed, and XNU's ppl_dispatch unmasks DAIF
+     * around interruptible PPL calls -- the interrupt is then delivered in
+     * guarded mode and vectors through VBAR_GL1, whose page SPRR makes
+     * executable only in GL1. The host CPU is never really in GL1 (GXF is
+     * emulated), so the fetch takes a permission fault that vectors to itself
+     * forever. Re-arming happens at the top of hvf_arch_vcpu_exec() once the
+     * guest GEXITs.
+     */
+    if (hvf_gxf_defer_irq()) {
+        hv_vcpu_set_pending_interrupt(cpu->accel->fd, HV_INTERRUPT_TYPE_IRQ,
+                                      false);
+        hv_vcpu_set_pending_interrupt(cpu->accel->fd, HV_INTERRUPT_TYPE_FIQ,
+                                      false);
+        /*
+         * The virtual timer is armed in hardware and does not go through
+         * hv_vcpu_set_pending_interrupt() at all, so withdrawing the pending
+         * lines alone still leaves one way for an interrupt to arrive in
+         * guarded mode. Mask it for the duration; hvf_gxf_exit() restores it.
+         */
+        if (!acc->vtimer_masked && !acc->gxf_vtimer_masked) {
+            hvf_ev(cpu, HVF_EV_VT_MASK, 0);
+            hv_vcpu_set_vtimer_mask(acc->fd, true);
+            acc->gxf_vtimer_masked = true;
+        }
+    }
+
+    /*
+     * The guarded stack is deliberately NOT re-tagged here. Re-tagging a page
+     * the guest is already using is unsound: there is no way to invalidate the
+     * guest's TLBs from the host under HVF, so the change is observed
+     * inconsistently and the failures move somewhere worse (measured: 14/18
+     * with it, against 36/40 without). The vector page is safe only because it
+     * is re-tagged once, early, before anything has translated it.
+     */
+    hvf_ev(cpu, HVF_EV_GENTER, env->gxf.sp_gl[1]);
+    hvf_restore_sp(env);
+    env->pc = env->gxf.gxf_enter_el[1];
+
+    trace_hvf_gxf_enter(env->gxf.elr_gl[1], env->pc);
+}
+
+static void hvf_gxf_exit(CPUState *cpu)
+{
+    ARMCPU *arm_cpu = ARM_CPU(cpu);
+    CPUARMState *env = &arm_cpu->env;
+    AccelCPUState *acc = cpu->accel;
+    uint32_t spsr;
+    uint64_t elr;
+
+    if (!hvf_gxf_is_guarded(env) || arm_current_el(env) != 1) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: GEXIT while not guarded\n",
+                      __func__);
+        hvf_raise_exception(cpu, EXCP_UDEF, syn_uncategorized(), 1);
+        return;
+    }
+
+    hvf_save_sp(env);
+
+    /* Save the (live) GL1 bank, restore the EL1 bank. */
+    hvf_gxf_sync_live_to_gl(env);
+    spsr = env->gxf.spsr_gl[1];
+    elr = env->gxf.elr_gl[1];
+
+    env->cp15.vbar_el[1] = acc->gxf_el1_saved.vbar;
+    env->cp15.tpidr_el[1] = acc->gxf_el1_saved.tpidr;
+    env->banked_spsr[BANK_SVC] = acc->gxf_el1_saved.spsr;
+    env->elr_el[1] = acc->gxf_el1_saved.elr;
+    env->cp15.esr_el[1] = acc->gxf_el1_saved.esr;
+    env->cp15.far_el[1] = acc->gxf_el1_saved.far;
+    env->sp_el[1] = acc->gxf_el1_saved.sp_el1;
+
+    spsr &= aarch64_pstate_valid_mask(&arm_cpu->isar);
+    pstate_write(env, spsr);
+    env->pstate &= ~PSTATE_SS;
+    env->gxf.gxf_status_el[1] &= ~1;
+
+    if (acc->gxf_vtimer_masked) {
+        acc->gxf_vtimer_masked = false;
+        if (!acc->vtimer_masked) {
+            hv_vcpu_set_vtimer_mask(acc->fd, false);
+        }
+    }
+
+    hvf_ev(cpu, HVF_EV_GEXIT, elr);
+    hvf_restore_sp(env);
+    env->pc = elr;
+
+    trace_hvf_gxf_exit(env->pc);
+}
+
+/* GL1-banked system registers: S3_6_C15_C9_* and ASPSR_GL11 (S3_6_C15_C8_3). */
+static bool hvf_gxf_sysreg_needs_sync(uint32_t reg)
+{
+    return SYSREG_OP0(reg) == 3 && SYSREG_OP1(reg) == 6 &&
+           SYSREG_CRN(reg) == 15;
+}
+
+#define SYSREG_SP_GL11 SYSREG(3, 6, 15, 9, 0)
+#define SYSREG_TPIDR_GL11 SYSREG(3, 6, 15, 9, 1)
+#define SYSREG_VBAR_GL11 SYSREG(3, 6, 15, 9, 2)
+#define SYSREG_SPSR_GL11 SYSREG(3, 6, 15, 9, 3)
+#define SYSREG_ESR_GL11 SYSREG(3, 6, 15, 9, 5)
+#define SYSREG_ELR_GL11 SYSREG(3, 6, 15, 9, 6)
+#define SYSREG_FAR_GL11 SYSREG(3, 6, 15, 9, 7)
+
+/*
+ * From GL1, the *_GL11 names address the EL1 (non-guarded) bank, which we
+ * keep in cpu->accel->gxf_el1_saved while guarded. Returns the storage for
+ * such a register, or NULL if `reg` is not one of them / not guarded.
+ */
+static uint64_t *hvf_gxf_el1_bank_slot(CPUState *cpu, uint32_t reg)
+{
+    CPUARMState *env = cpu_env(cpu);
+    AccelCPUState *acc = cpu->accel;
+
+    if (!hvf_gxf_is_guarded(env)) {
+        return NULL;
+    }
+
+    switch (reg) {
+    case SYSREG_SP_GL11:
+        return &acc->gxf_el1_saved.sp_el1;
+    case SYSREG_TPIDR_GL11:
+        return &acc->gxf_el1_saved.tpidr;
+    case SYSREG_VBAR_GL11:
+        return &acc->gxf_el1_saved.vbar;
+    case SYSREG_SPSR_GL11:
+        return &acc->gxf_el1_saved.spsr;
+    case SYSREG_ESR_GL11:
+        return &acc->gxf_el1_saved.esr;
+    case SYSREG_ELR_GL11:
+        return &acc->gxf_el1_saved.elr;
+    case SYSREG_FAR_GL11:
+        return &acc->gxf_el1_saved.far;
+    default:
+        return NULL;
+    }
 }
 
 static void hvf_psci_cpu_off(ARMCPU *arm_cpu)
@@ -1220,6 +2166,14 @@ static int hvf_sysreg_read(CPUState *cpu, uint32_t reg, uint64_t *val)
 {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
     CPUARMState *env = &arm_cpu->env;
+    uint64_t *gl11;
+
+    gl11 = hvf_gxf_el1_bank_slot(cpu, reg);
+    if (gl11 != NULL) {
+        *val = *gl11;
+        trace_hvf_emu_reginfo_read("gxf-el1-bank", "GL11", *val);
+        return 0;
+    }
 
     if (arm_feature(env, ARM_FEATURE_PMU)) {
         switch (reg) {
@@ -1475,6 +2429,14 @@ static int hvf_sysreg_write(CPUState *cpu, uint32_t reg, uint64_t val)
 {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
     CPUARMState *env = &arm_cpu->env;
+    uint64_t *gl11;
+
+    gl11 = hvf_gxf_el1_bank_slot(cpu, reg);
+    if (gl11 != NULL) {
+        *gl11 = val;
+        trace_hvf_emu_reginfo_write("gxf-el1-bank", "GL11", val);
+        return 0;
+    }
 
     trace_hvf_sysreg_write(reg,
                            SYSREG_OP0(reg),
@@ -1550,13 +2512,28 @@ static int hvf_sysreg_write(CPUState *cpu, uint32_t reg, uint64_t val)
     case SYSREG_OSLAR_EL1:
         env->cp15.oslsr_el1 = val & 1;
         return 0;
-    case SYSREG_CNTP_CTL_EL0:
-        /*
-         * Guests should not rely on the physical counter, but macOS emits
-         * disable writes to it. Let it do so, but ignore the requests.
-         */
-        qemu_log_mask(LOG_UNIMP, "Unsupported write to CNTP_CTL_EL0\n");
-        return 0;
+    /*
+     * SYSREG_CNTP_CTL_EL0 is deliberately *not* handled here.
+     *
+     * Upstream ignores writes to it ("guests should not rely on the physical
+     * counter, but macOS emits disable writes to it"). Dropping them silently
+     * breaks any guest that actually uses the physical timer -- notably the
+     * emulated SEPROM, which runs on the SEP core under HVF: it does
+     *
+     *     msr CNTP_TVAL_EL0, x9   ; <- worked (falls through to the cpreg path)
+     *     msr CNTP_CTL_EL0,  #3   ; ENABLE|IMASK  <- was silently dropped
+     *     ...
+     *     mrs x8, CNTP_CTL_EL0
+     *     tbz w8, #0, <panic 0x7E>
+     *
+     * and the read then returned 0, so SEPROM panicked, and its panic handler
+     * panicked again (0x118) and parked the core in wfi/wfe forever. That is
+     * why SEP never serviced its mailbox and a restore's RSEP boot timed out.
+     *
+     * Letting it fall through to the generic fallback below (the same path
+     * CNTP_TVAL_EL0 already takes) runs the real gt_phys_redir_ctl_write(),
+     * which is also what macOS's disable writes actually mean.
+     */
     case SYSREG_OSDLR_EL1:
         /* Dummy register */
         return 0;
@@ -1688,15 +2665,83 @@ static int hvf_sysreg_write(CPUState *cpu, uint32_t reg, uint64_t val)
 }
 
 /* Must be called by the owning thread */
+/*
+ * Off by default: none of this is needed any more.
+ *
+ * Withholding interrupts from guarded mode, masking the vtimer across it and
+ * re-tagging the VBAR_GL1 page were all built to work around boots that wedged
+ * with a vCPU spinning on a fault taken inside GL1. The actual cause was the
+ * pmap_switch PAC patch corrupting SCTLR_EL1 (see
+ * ck_kp_hvf_pac_pmap_switch_callback); with that fixed, 24/24 boots succeed
+ * with all of this disabled, slightly faster than with it enabled -- each
+ * GENTER was paying two extra hypercalls, ~1.2M of them per boot.
+ *
+ * Kept behind INFERNO_HVF_GXF_IRQ_DEFER=1 because the hazard it describes is
+ * real: the host CPU never enters GL1, so a fault taken there vectors through
+ * a page it cannot fetch.
+ */
+static bool hvf_gxf_defer_irq(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("INFERNO_HVF_GXF_IRQ_DEFER");
+        on = e != NULL && atoi(e) != 0;
+    }
+    return on;
+}
+
 static int hvf_inject_interrupts(CPUState *cpu)
 {
+    /*
+     * Never deliver an interrupt while the guest is in guarded mode.
+     *
+     * XNU's ppl_dispatch unmasks IRQs around interruptible PPL calls, so an
+     * interrupt can land while GL1 is active. On real silicon that vectors
+     * through VBAR_GL1 into PPL text, which GXF makes executable for the
+     * duration. We emulate the GXF register bank but the guest's SPRR/APRR
+     * writes are trapped and answered out of `env`, so the host's stage-1
+     * permissions still say that page is not executable at EL1. The fetch
+     * takes a permission fault, which vectors to the *same* page, and the vCPU
+     * spins on an instruction abort forever at 100% with no hypervisor exit --
+     * the boot stops dead with no further serial output. It hit roughly a
+     * third of boots, which is how often an interrupt happened to arrive
+     * inside that window.
+     *
+     * Holding the interrupt costs nothing: GEXIT is rewritten to an HVC, so we
+     * are called again as soon as the guest leaves guarded mode, and guarded
+     * sections are short. INFERNO_HVF_GXF_IRQ_DEFER=0 restores the old
+     * behaviour.
+     */
+    if (hvf_gxf_defer_irq() && hvf_gxf_is_guarded(&ARM_CPU(cpu)->env)) {
+        /*
+         * Withdraw rather than merely skip. hv_vcpu_set_pending_interrupt() is
+         * sticky: an interrupt armed before the guest ran GENTER stays pending
+         * and HVF delivers it the instant ppl_dispatch unmasks IRQs, so not
+         * calling it again changes nothing. Both lines are re-asserted from
+         * the top of hvf_arch_vcpu_exec() once the guest leaves GL1.
+         */
+        hv_vcpu_set_pending_interrupt(cpu->accel->fd, HV_INTERRUPT_TYPE_IRQ,
+                                      false);
+        hv_vcpu_set_pending_interrupt(cpu->accel->fd, HV_INTERRUPT_TYPE_FIQ,
+                                      false);
+        if (cpu_test_interrupt(cpu, CPU_INTERRUPT_FIQ) ||
+            cpu_test_interrupt(cpu, CPU_INTERRUPT_HARD)) {
+            cpu->accel->gxf_irq_deferred++;
+            hvf_ev(cpu, HVF_EV_WITHDRAW, 0);
+        }
+        return 0;
+    }
+
     if (cpu_test_interrupt(cpu, CPU_INTERRUPT_FIQ)) {
+        hvf_ev(cpu, HVF_EV_FIQ_ARM, 0);
         trace_hvf_inject_fiq();
         hv_vcpu_set_pending_interrupt(cpu->accel->fd, HV_INTERRUPT_TYPE_FIQ,
                                       true);
     }
 
     if (cpu_test_interrupt(cpu, CPU_INTERRUPT_HARD)) {
+        hvf_ev(cpu, HVF_EV_IRQ_ARM, 0);
         trace_hvf_inject_irq();
         hv_vcpu_set_pending_interrupt(cpu->accel->fd, HV_INTERRUPT_TYPE_IRQ,
                                       true);
@@ -1809,11 +2854,192 @@ static void hvf_sync_vtimer(CPUState *cpu)
     qemu_set_irq(arm_cpu->gt_timer_outputs[GTIMER_VIRT], irq_state);
 
     if (!irq_state) {
-        /* Timer no longer asserting, we can unmask it */
+        /*
+         * Timer no longer asserting, we can unmask it -- but not while the
+         * guest is in guarded mode. The virtual timer is delivered by hardware
+         * without going through hv_vcpu_set_pending_interrupt(), so unmasking
+         * here would reopen the one path by which an interrupt can still be
+         * taken in GL1, where the vector page is not executable. GEXIT calls
+         * back in through hvf_handle_vmexit(), so the unmask only slips by one
+         * guarded section.
+         */
+        if (hvf_gxf_defer_irq() && hvf_gxf_is_guarded(&ARM_CPU(cpu)->env)) {
+            return;
+        }
+        hvf_ev(cpu, HVF_EV_VT_UNMASK, 0);
         r = hv_vcpu_set_vtimer_mask(cpu->accel->fd, false);
         assert_hvf_ok(r);
         cpu->accel->vtimer_masked = false;
     }
+}
+
+/*
+ * Exit accounting. Profiling the guest boot showed the vCPU threads spending
+ * ~61% of their time blocked on the BQL in hvf_arch_vcpu_exec and only ~14%
+ * actually inside hv_vcpu_run -- every exit takes the global lock, so what
+ * matters for guest speed is how many exits there are and of what kind.
+ * INFERNO_HVF_EXIT_STATS=<n> prints a histogram every n exits.
+ */
+static uint64_t hvf_exit_counts[64];
+#define HVF_SYSREG_SLOTS 512
+static uint32_t hvf_sysreg_keys[HVF_SYSREG_SLOTS];
+static uint64_t hvf_sysreg_counts[HVF_SYSREG_SLOTS];
+static uint64_t hvf_exit_total;
+
+/* Keep the whole encoding, not a truncated one: op0/op1/op2 live above CRN. */
+static void hvf_count_sysreg(uint32_t reg)
+{
+    int i;
+
+    for (i = 0; i < HVF_SYSREG_SLOTS; i++) {
+        if (hvf_sysreg_keys[i] == reg) {
+            hvf_sysreg_counts[i]++;
+            return;
+        }
+        if (hvf_sysreg_keys[i] == 0 && hvf_sysreg_counts[i] == 0) {
+            hvf_sysreg_keys[i] = reg;
+            hvf_sysreg_counts[i] = 1;
+            return;
+        }
+    }
+}
+
+static void hvf_account_exit(uint32_t ec, uint64_t syndrome)
+{
+    static int64_t every = -1;
+
+    if (every < 0) {
+        const char *env_every = getenv("INFERNO_HVF_EXIT_STATS");
+        every = env_every != NULL ? strtoll(env_every, NULL, 0) : 0;
+    }
+    if (every == 0) {
+        return;
+    }
+
+    qatomic_inc(&hvf_exit_counts[ec & 63]);
+    if (ec == EC_SYSTEMREGISTERTRAP) {
+        /* keep reads and writes apart: a spin shows up as reads >> writes */
+        hvf_count_sysreg((syndrome & SYSREG_MASK) | (syndrome & 1 ? 0x80000000u : 0));
+    }
+    if (qatomic_fetch_inc(&hvf_exit_total) % every == 0) {
+        int i;
+        fprintf(stderr, "hvf-exits total=%llu:",
+                (unsigned long long)hvf_exit_total);
+        for (i = 0; i < 64; i++) {
+            if (hvf_exit_counts[i]) {
+                fprintf(stderr, " ec%02x=%llu", i,
+                        (unsigned long long)hvf_exit_counts[i]);
+            }
+        }
+        fprintf(stderr, "\n");
+        if (hvf_exit_counts[EC_SYSTEMREGISTERTRAP & 63]) {
+            int top[8] = {0}, n;
+            for (i = 0; i < HVF_SYSREG_SLOTS; i++) {
+                for (n = 0; n < 8; n++) {
+                    if (hvf_sysreg_counts[i] > hvf_sysreg_counts[top[n]]) {
+                        memmove(&top[n + 1], &top[n], (7 - n) * sizeof(int));
+                        top[n] = i;
+                        break;
+                    }
+                }
+            }
+            fprintf(stderr, "hvf-sysreg:");
+            for (n = 0; n < 8 && hvf_sysreg_counts[top[n]]; n++) {
+                uint32_t reg = hvf_sysreg_keys[top[n]];
+                fprintf(stderr, " s%d_%d_c%d_c%d_%d%s=%llu",
+                        SYSREG_OP0(reg), SYSREG_OP1(reg), SYSREG_CRN(reg),
+                        SYSREG_CRM(reg), SYSREG_OP2(reg),
+                        (hvf_sysreg_keys[top[n]] & 0x80000000u) ? "/r" : "/w",
+                        (unsigned long long)hvf_sysreg_counts[top[n]]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+}
+
+
+/*
+ * A GXF transition only touches a dozen registers, but the HVC path was
+ * reaching for cpu_synchronize_state() and then leaving vcpu_dirty set, i.e. a
+ * full get of every cpreg on the way in and a full put on the way out -- about
+ * 250 hv_vcpu_get_sys_reg()/set_sys_reg() calls each way, 2.4 million times per
+ * boot. Sync exactly what hvf_gxf_enter()/hvf_gxf_exit() read and write
+ * instead. Off by default: measured over 5 boots each it showed no benefit
+ * (min 31 s vs 36 s, median worse) and it is a partial state sync, so the risk
+ * is not worth an unproven gain. INFERNO_HVF_FAST_GXF=1 turns it on.
+ */
+static const struct {
+    uint16_t hv;
+    size_t offset;
+} hvf_gxf_regs[] = {
+    { HV_SYS_REG_SP_EL0,    offsetof(CPUARMState, sp_el[0]) },
+    { HV_SYS_REG_SP_EL1,    offsetof(CPUARMState, sp_el[1]) },
+    { HV_SYS_REG_VBAR_EL1,  offsetof(CPUARMState, cp15.vbar_el[1]) },
+    { HV_SYS_REG_TPIDR_EL1, offsetof(CPUARMState, cp15.tpidr_el[1]) },
+    { HV_SYS_REG_SPSR_EL1,  offsetof(CPUARMState, banked_spsr[BANK_SVC]) },
+    { HV_SYS_REG_ELR_EL1,   offsetof(CPUARMState, elr_el[1]) },
+    { HV_SYS_REG_ESR_EL1,   offsetof(CPUARMState, cp15.esr_el[1]) },
+    { HV_SYS_REG_FAR_EL1,   offsetof(CPUARMState, cp15.far_el[1]) },
+    { HV_SYS_REG_SCTLR_EL1, offsetof(CPUARMState, cp15.sctlr_el[1]) },
+};
+
+static bool hvf_gxf_fast_enabled(void)
+{
+    static int8_t enabled = -1;
+
+    if (enabled < 0) {
+        const char *e = getenv("INFERNO_HVF_FAST_GXF");
+        enabled = (e == NULL || atoi(e) != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
+static void hvf_gxf_fast_sync_in(CPUState *cpu)
+{
+    CPUARMState *env = cpu_env(cpu);
+    uint64_t val;
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(hvf_gxf_regs); i++) {
+        assert_hvf_ok(hv_vcpu_get_sys_reg(cpu->accel->fd, hvf_gxf_regs[i].hv,
+                                          &val));
+        *(uint64_t *)((void *)env + hvf_gxf_regs[i].offset) = val;
+    }
+    assert_hvf_ok(hv_vcpu_get_reg(cpu->accel->fd, HV_REG_PC, &val));
+    env->pc = val;
+    assert_hvf_ok(hv_vcpu_get_reg(cpu->accel->fd, HV_REG_CPSR, &val));
+    pstate_write(env, val);
+    hvf_restore_sp(env);
+}
+
+static void hvf_gxf_fast_sync_out(CPUState *cpu)
+{
+    CPUARMState *env = cpu_env(cpu);
+    int i;
+
+    hvf_save_sp(env);
+    for (i = 0; i < ARRAY_SIZE(hvf_gxf_regs); i++) {
+        assert_hvf_ok(hv_vcpu_set_sys_reg(
+            cpu->accel->fd, hvf_gxf_regs[i].hv,
+            *(uint64_t *)((void *)env + hvf_gxf_regs[i].offset)));
+    }
+    assert_hvf_ok(hv_vcpu_set_reg(cpu->accel->fd, HV_REG_PC, env->pc));
+    assert_hvf_ok(hv_vcpu_set_reg(cpu->accel->fd, HV_REG_CPSR,
+                                  pstate_read(env)));
+}
+
+/* Only take the short path when enter/exit will not need anything else. */
+static bool hvf_gxf_fast_ok(CPUState *cpu, bool genter)
+{
+    CPUARMState *env = cpu_env(cpu);
+
+    if (arm_current_el(env) != 1) {
+        return false;
+    }
+    if (genter) {
+        return (env->gxf.gxf_config_el[1] & 1) && !hvf_gxf_is_guarded(env);
+    }
+    return hvf_gxf_is_guarded(env);
 }
 
 static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
@@ -1825,6 +3051,31 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
     bool advance_pc = false;
     hv_return_t r;
     int ret = 0;
+
+    hvf_account_exit(ec, syndrome);
+
+    /*
+     * The hottest trap by far is one Apple implementation-defined register --
+     * INFERNO_HVF_TRACE_SYSREG=<encoding> prints the guest PC for the first few
+     * accesses so the kernel code hammering it can be found.
+     */
+    if (ec == EC_SYSTEMREGISTERTRAP) {
+        static int64_t want = -1;
+        static int shown;
+
+        if (want < 0) {
+            const char *e = getenv("INFERNO_HVF_TRACE_SYSREG");
+            want = e != NULL ? strtoll(e, NULL, 0) : 0;
+        }
+        if (want != 0 && (syndrome & SYSREG_MASK) == (uint32_t)want &&
+            shown < 8) {
+            shown++;
+            cpu_synchronize_state(cpu);
+            fprintf(stderr, "hvf-sysreg-pc: reg=%#x read=%d pc=%#llx\n",
+                    (uint32_t)(syndrome & SYSREG_MASK), (int)(syndrome & 1),
+                    (unsigned long long)env->pc);
+        }
+    }
 
     switch (ec) {
     case EC_SOFTWARESTEP: {
@@ -1933,21 +3184,67 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
         uint64_t val;
         int sysreg_ret = 0;
 
+        /*
+         * The GXF/SPRR register handlers look at PSTATE and, while guarded,
+         * at the live EL1 bank; make sure env is current (and dirty, so
+         * that any changes get flushed back).
+         */
+        bool gxf_sync = hvf_gxf_sysreg_needs_sync(reg);
+        bool gxf_guarded = false;
+
+        if (gxf_sync) {
+            cpu_synchronize_state(cpu);
+            gxf_guarded = hvf_gxf_is_guarded(env);
+            if (getenv("INFERNO_DEBUG_SPRR") &&
+                (reg == SYSREG(3, 6, 15, 1, 5) ||
+                 reg == SYSREG(3, 6, 15, 3, 1) ||
+                 reg == SYSREG(3, 6, 15, 1, 7) ||
+                 reg == SYSREG(3, 6, 15, 3, 3))) {
+                fprintf(stderr,
+                        "[sprr] cpu%d el%d %s S3_6_C15_C%u_%u pc=%#llx "
+                        "in=%#llx cur_sprr_el0=%#llx mprr_el0=%#llx\n",
+                        cpu->cpu_index, arm_current_el(env),
+                        isread ? "rd" : "wr", SYSREG_CRM(reg), SYSREG_OP2(reg),
+                        (unsigned long long)env->pc,
+                        (unsigned long long)(isread ? 0 : hvf_get_reg(cpu, rt)),
+                        (unsigned long long)env->sprr.sprr_el_br_el1[0][0],
+                        (unsigned long long)env->sprr.mprr_el_br_el1[0][0]);
+            }
+            if (gxf_guarded) {
+                /* While guarded the GL1 bank lives in the real EL1 regs. */
+                hvf_gxf_sync_live_to_gl(env);
+            }
+        }
+
         if (isread) {
             sysreg_ret = hvf_sysreg_read(cpu, reg, &val);
-            if (!sysreg_ret) {
-                trace_hvf_sysreg_read(reg,
-                                      SYSREG_OP0(reg),
-                                      SYSREG_OP1(reg),
-                                      SYSREG_CRN(reg),
-                                      SYSREG_CRM(reg),
-                                      SYSREG_OP2(reg),
-                                      val);
-                hvf_set_reg(cpu, rt, val);
-            }
         } else {
             val = hvf_get_reg(cpu, rt);
             sysreg_ret = hvf_sysreg_write(cpu, reg, val);
+        }
+
+        if (gxf_sync) {
+            /* hvf_get_reg() flushed; re-dirty so our changes get pushed. */
+            cpu->vcpu_dirty = true;
+            if (gxf_guarded) {
+                hvf_gxf_sync_gl_to_live(env);
+            }
+        }
+
+        if (getenv("INFERNO_DEBUG_SPRR") && isread && !sysreg_ret &&
+            (reg == SYSREG(3, 6, 15, 1, 5) || reg == SYSREG(3, 6, 15, 3, 1))) {
+            fprintf(stderr, "[sprr]   -> read value %#llx\n",
+                    (unsigned long long)val);
+        }
+        if (isread && !sysreg_ret) {
+            trace_hvf_sysreg_read(reg,
+                                  SYSREG_OP0(reg),
+                                  SYSREG_OP1(reg),
+                                  SYSREG_CRN(reg),
+                                  SYSREG_CRM(reg),
+                                  SYSREG_OP2(reg),
+                                  val);
+            hvf_set_reg(cpu, rt, val);
         }
 
         advance_pc = !sysreg_ret;
@@ -1960,7 +3257,57 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
         }
         break;
     case EC_AA64_HVC:
+        if (hvf_gxf_fast_enabled() && !cpu->vcpu_dirty &&
+            arm_feature(env, ARM_FEATURE_GXF) &&
+            (GXF_HVC_IMM_IS_GENTER(syndrome & 0xffff) ||
+             GXF_HVC_IMM_IS_GEXIT(syndrome & 0xffff))) {
+            bool genter = GXF_HVC_IMM_IS_GENTER(syndrome & 0xffff);
+
+            hvf_gxf_fast_sync_in(cpu);
+            if (hvf_gxf_fast_ok(cpu, genter)) {
+                if (genter) {
+                    hvf_gxf_enter(cpu, GXF_INSN_IMM(syndrome));
+                } else {
+                    hvf_gxf_exit(cpu);
+                }
+                hvf_gxf_fast_sync_out(cpu);
+                break;
+            }
+            /* Not a clean transition -- fall back to the full sync below. */
+        }
         cpu_synchronize_state(cpu);
+        /* INFERNO_GXF_COUNT: how hot is the rewritten GENTER/GEXIT path? Each
+         * one costs a full cpu_synchronize_state() in and a full register
+         * writeback out, so the rate decides whether that is worth trimming. */
+        if (GXF_HVC_IMM_IS_GENTER(syndrome & 0xffff) ||
+            GXF_HVC_IMM_IS_GEXIT(syndrome & 0xffff)) {
+            static uint64_t inferno_gxf_traps;
+            static int inferno_gxf_report;
+            if (++inferno_gxf_traps % 200000 == 0 && getenv("INFERNO_GXF_COUNT")) {
+                fprintf(stderr, "INFERNO: %llu GXF traps\n",
+                        (unsigned long long)inferno_gxf_traps);
+                inferno_gxf_report++;
+            }
+        }
+        if (GXF_HVC_IMM_IS_XPRR(syndrome & 0xffff)) {
+            /* Rewritten pmap_set_pte_xprr_perm(), see kernel_patches.c */
+            hvf_xprr_set_pte(cpu);
+            cpu->vcpu_dirty = true;
+            break;
+        }
+        if (arm_feature(env, ARM_FEATURE_GXF) &&
+            GXF_HVC_IMM_IS_GENTER(syndrome & 0xffff)) {
+            /* Rewritten GENTER, see hw/arm/apple-silicon/kernel_patches.c */
+            hvf_gxf_enter(cpu, GXF_INSN_IMM(syndrome));
+            cpu->vcpu_dirty = true;
+            break;
+        }
+        if (arm_feature(env, ARM_FEATURE_GXF) &&
+            GXF_HVC_IMM_IS_GEXIT(syndrome & 0xffff)) {
+            hvf_gxf_exit(cpu);
+            cpu->vcpu_dirty = true;
+            break;
+        }
         if (arm_cpu->psci_conduit == QEMU_PSCI_CONDUIT_HVC) {
             /* Do NOT advance $pc for HVC */
             if (!hvf_handle_psci_call(cpu)) {
@@ -2040,6 +3387,7 @@ static int hvf_handle_vmexit(CPUState *cpu, hv_vcpu_exit_t *exit)
         ret = hvf_handle_exception(cpu, &exit->exception);
         break;
     case HV_EXIT_REASON_VTIMER_ACTIVATED:
+        hvf_ev(cpu, HVF_EV_VT_ACTIVE, 0);
         qemu_set_irq(arm_cpu->gt_timer_outputs[GTIMER_VIRT], 1);
         cpu->accel->vtimer_masked = true;
         break;
@@ -2054,6 +3402,91 @@ static int hvf_handle_vmexit(CPUState *cpu, hv_vcpu_exit_t *exit)
     return ret;
 }
 
+
+/* Registers that hvf_sysreg_read/write answer from `env` alone, with no device
+ * or timer state behind them, so no BQL is needed: Apple's APCTL_EL1 and the
+ * op1=6 CRN=15 block (GXF/GL11/SPRR). */
+static bool hvf_sysreg_is_cpu_local(uint32_t reg)
+{
+    if (reg == SYSREG(3, 4, 15, 0, 4)) {
+        return true;                                    /* APCTL_EL1 */
+    }
+    return SYSREG_OP0(reg) == 3 && SYSREG_OP1(reg) == 6 &&
+           SYSREG_CRN(reg) == 15;
+}
+
+#define HVF_MAX_UNLOCKED_EXITS 256
+
+/*
+ * True once an interrupt hvf_inject_interrupts() held back for guarded mode
+ * can finally be delivered. GEXIT is handled inside the unlocked loop when the
+ * GXF fast path is on, so without this the loop could keep re-entering the
+ * guest for up to HVF_MAX_UNLOCKED_EXITS before returning to the injection
+ * point at the top of hvf_arch_vcpu_exec().
+ */
+static bool hvf_gxf_irq_releasable(CPUState *cpu)
+{
+    return hvf_gxf_defer_irq() &&
+           !hvf_gxf_is_guarded(&ARM_CPU(cpu)->env) &&
+           (cpu_test_interrupt(cpu, CPU_INTERRUPT_FIQ) ||
+            cpu_test_interrupt(cpu, CPU_INTERRUPT_HARD));
+}
+
+static bool hvf_handle_sysreg_unlocked(CPUState *cpu)
+{
+    static int8_t enabled = -1;
+    hv_vcpu_exit_t *exit = cpu->accel->exit;
+    uint64_t syndrome;
+    uint32_t ec, reg;
+
+    if (enabled < 0) {
+        const char *e = getenv("INFERNO_HVF_FAST_SYSREG");
+        enabled = (e == NULL || atoi(e) != 0) ? 1 : 0;
+    }
+    if (!enabled || exit->reason != HV_EXIT_REASON_EXCEPTION) {
+        return false;
+    }
+
+    syndrome = exit->exception.syndrome;
+    ec = syn_get_ec(syndrome);
+
+    /*
+     * GXF transitions are the other half of the exit budget (2.4M per boot),
+     * and hvf_gxf_enter()/hvf_gxf_exit() only move state around inside `env`
+     * -- so long as we sync just the registers they touch rather than reaching
+     * for cpu_synchronize_state(), which would need the lock.
+     */
+    if (ec == EC_AA64_HVC && hvf_gxf_fast_enabled() && !cpu->vcpu_dirty &&
+        arm_feature(cpu_env(cpu), ARM_FEATURE_GXF) &&
+        (GXF_HVC_IMM_IS_GENTER(syndrome & 0xffff) ||
+         GXF_HVC_IMM_IS_GEXIT(syndrome & 0xffff))) {
+        bool genter = GXF_HVC_IMM_IS_GENTER(syndrome & 0xffff);
+
+        hvf_gxf_fast_sync_in(cpu);
+        if (!hvf_gxf_fast_ok(cpu, genter)) {
+            return false;       /* let the locked path sort it out */
+        }
+        hvf_account_exit(ec, syndrome);
+        if (genter) {
+            hvf_gxf_enter(cpu, GXF_INSN_IMM(syndrome));
+        } else {
+            hvf_gxf_exit(cpu);
+        }
+        hvf_gxf_fast_sync_out(cpu);
+        return true;
+    }
+
+    if (ec != EC_SYSTEMREGISTERTRAP) {
+        return false;
+    }
+    reg = syndrome & SYSREG_MASK;
+    if (!hvf_sysreg_is_cpu_local(reg)) {
+        return false;
+    }
+
+    return hvf_handle_exception(cpu, &exit->exception) == 0;
+}
+
 int hvf_arch_vcpu_exec(CPUState *cpu)
 {
     int ret;
@@ -2066,15 +3499,35 @@ int hvf_arch_vcpu_exec(CPUState *cpu)
     flush_cpu_state(cpu);
 
     do {
+        int fast;
+
         if (!(cpu->singlestep_enabled & SSTEP_NOIRQ) &&
             hvf_inject_interrupts(cpu)) {
             return EXCP_INTERRUPT;
         }
 
+        /*
+         * Apple's implementation-defined registers are the hot exits by a wide
+         * margin -- APCTL_EL1 alone is ~42% of them, and the GXF banked
+         * registers most of the rest -- and they are pure per-CPU state that
+         * hvf_sysreg_read/write serve straight out of `env`. Taking the BQL for
+         * those serialises all six vCPUs on one mutex: a boot profile showed
+         * the vCPU threads spending ~61% of their time in bql_lock_impl and
+         * only ~14% inside hv_vcpu_run. Re-enter the guest for those without
+         * ever taking the lock, but cap the run so interrupt injection at the
+         * top of the outer loop still happens promptly.
+         */
         bql_unlock();
-        cpu_exec_start(cpu);
-        r = hv_vcpu_run(cpu->accel->fd);
-        cpu_exec_end(cpu);
+        for (fast = 0; ; fast++) {
+            cpu_exec_start(cpu);
+            r = hv_vcpu_run(cpu->accel->fd);
+            cpu_exec_end(cpu);
+            if (r != HV_SUCCESS || fast >= HVF_MAX_UNLOCKED_EXITS ||
+                hvf_gxf_irq_releasable(cpu) ||
+                !hvf_handle_sysreg_unlocked(cpu)) {
+                break;
+            }
+        }
         bql_lock();
         switch (r) {
         case HV_SUCCESS:
@@ -2115,8 +3568,208 @@ static void hvf_vm_state_change(void *opaque, bool running, RunState state)
     }
 }
 
+/*
+ * Hang watchdog.
+ *
+ * A vCPU that takes a synchronous exception while in guarded mode (GXF) and
+ * already on SP_EL1 vectors to the "Current EL with SPx" entry of VBAR_GL1,
+ * which XNU fills with an unconditional `B .`. The vCPU then spins at 100%
+ * without ever exiting to the hypervisor, so nothing in QEMU notices -- the
+ * boot simply stops. INFERNO_HVF_HANG_WATCH=<seconds> samples every vCPU's PC
+ * once a second and, when one has not moved for that long, dumps the state
+ * that identifies the faulting access (ESR/FAR/ELR are still the ones from the
+ * exception that landed there).
+ */
+static QEMUTimer *hvf_hang_timer;
+static int hvf_hang_secs;
+
+/*
+ * Walk the guest's TTBR1 stage-1 tables by hand and print every descriptor on
+ * the way down. The faulting address comes back as a permission fault, so the
+ * mapping exists -- what matters is the AP/PXN/UXN bits of the leaf and how
+ * SPRR remaps them.
+ */
+static void hvf_hang_walk(CPUState *cpu, uint64_t va)
+{
+    CPUARMState *env = &ARM_CPU(cpu)->env;
+    uint64_t tcr = env->cp15.tcr_el[1];
+    uint64_t desc, pa;
+    unsigned tg1 = extract64(tcr, 30, 2);
+    unsigned t1sz = extract64(tcr, 16, 6);
+    unsigned page_bits, stride, va_bits, bits;
+    int level;
+
+    switch (tg1) {
+    case 1: page_bits = 14; break;      /* 16K */
+    case 2: page_bits = 12; break;      /* 4K  */
+    case 3: page_bits = 16; break;      /* 64K */
+    default:
+        fprintf(stderr, "  ptw: unexpected TG1=%u\n", tg1);
+        return;
+    }
+    stride = page_bits - 3;
+    va_bits = 64 - t1sz;
+    level = 3;
+    bits = page_bits;
+    while (bits + stride < va_bits) {
+        bits += stride;
+        level--;
+    }
+
+    pa = env->cp15.ttbr1_el[1] & MAKE_64BIT_MASK(1, 47);
+    pa &= ~MAKE_64BIT_MASK(0, page_bits > 12 ? 4 : 0);
+    fprintf(stderr, "  ptw: va=%#018" PRIx64 " tcr=%#018" PRIx64
+            " tg1=%u(%uK) t1sz=%u start_level=%d ttbr1=%#018" PRIx64 "\n",
+            va, tcr, tg1, 1u << (page_bits - 10), t1sz, level,
+            env->cp15.ttbr1_el[1]);
+
+    for (; level <= 3; level++) {
+        unsigned shift = page_bits + stride * (3 - level);
+        unsigned idx_bits = (level == 3) ? stride :
+                            MIN(stride, va_bits - shift);
+        uint64_t idx = extract64(va, shift, idx_bits);
+
+        desc = address_space_ldq(&address_space_memory, pa + idx * 8,
+                                 MEMTXATTRS_UNSPECIFIED, NULL);
+        fprintf(stderr, "  ptw: L%d table=%#018" PRIx64 " idx=%#" PRIx64
+                " desc=%#018" PRIx64 "%s\n", level, pa, idx, desc,
+                (desc & 1) ? "" : "  <INVALID>");
+        if (!(desc & 1)) {
+            return;
+        }
+        if (level < 3 && (desc & 3) == 1) {
+            fprintf(stderr, "  ptw: L%d is a block\n", level);
+            break;
+        }
+        pa = desc & MAKE_64BIT_MASK(page_bits, 48 - page_bits);
+    }
+
+    fprintf(stderr, "  ptw: leaf ap=%u sh=%u af=%u ns=%u attridx=%u "
+            "pxn=%u uxn=%u nG=%u\n",
+            (unsigned)extract64(desc, 6, 2), (unsigned)extract64(desc, 8, 2),
+            (unsigned)extract64(desc, 10, 1), (unsigned)extract64(desc, 5, 1),
+            (unsigned)extract64(desc, 2, 3), (unsigned)extract64(desc, 53, 1),
+            (unsigned)extract64(desc, 54, 1), (unsigned)extract64(desc, 11, 1));
+    fprintf(stderr, "  sprr: config_el1=%#018" PRIx64
+            " perm_el1=%#018" PRIx64 " perm_el0=%#018" PRIx64 "\n",
+            env->sprr.sprr_config_el[1], env->sprr.sprr_el_br_el1[1][1],
+            env->sprr.sprr_el_br_el1[1][0]);
+}
+
+static void hvf_hang_dump(CPUState *cpu)
+{
+    CPUARMState *env = &ARM_CPU(cpu)->env;
+    uint32_t esr = env->cp15.esr_el[1];
+
+    fprintf(stderr,
+            "hvf-hang: cpu%d stuck %ds at pc=%#018" PRIx64 "\n"
+            "  pstate=%#010x el=%d spsel=%d guarded=%d\n"
+            "  esr_el1=%#010x ec=%#04x iss=%#08x far_el1=%#018" PRIx64 "\n"
+            "  elr_el1=%#018" PRIx64 " spsr_el1=%#010x vbar_el1=%#018" PRIx64
+            "\n"
+            "  sp=%#018" PRIx64 " sp_el0=%#018" PRIx64 " sp_el1=%#018" PRIx64
+            "\n"
+            "  gl1: vbar=%#018" PRIx64 " sp=%#018" PRIx64 " elr=%#018" PRIx64
+            " esr=%#010x far=%#018" PRIx64 "\n"
+            "  x30=%#018" PRIx64 " x0=%#018" PRIx64 " x1=%#018" PRIx64 "\n",
+            cpu->cpu_index, hvf_hang_secs, env->pc,
+            pstate_read(env), arm_current_el(env),
+            (int)!!(env->pstate & PSTATE_SP), (int)hvf_gxf_is_guarded(env),
+            esr, esr >> 26, esr & 0x1ffffff, env->cp15.far_el[1],
+            env->elr_el[1], env->banked_spsr[BANK_SVC], env->cp15.vbar_el[1],
+            env->xregs[31], env->sp_el[0], env->sp_el[1],
+            env->gxf.vbar_gl[1], env->gxf.sp_gl[1], env->gxf.elr_gl[1],
+            (uint32_t)env->gxf.esr_gl[1], env->gxf.far_gl[1],
+            env->xregs[30], env->xregs[0], env->xregs[1]);
+
+    fprintf(stderr, "  sctlr_el1=%#018" PRIx64 " (A=%d SA=%d SA0=%d) "
+            "mair_el1=%#018" PRIx64 " tcr=%#018" PRIx64 "\n",
+            env->cp15.sctlr_el[1],
+            (int)extract64(env->cp15.sctlr_el[1], 1, 1),
+            (int)extract64(env->cp15.sctlr_el[1], 3, 1),
+            (int)extract64(env->cp15.sctlr_el[1], 4, 1),
+            env->cp15.mair_el[1], env->cp15.tcr_el[1]);
+    fprintf(stderr, "  gxf: enter_el1=%#018" PRIx64 " status=%#018" PRIx64
+            " config=%#018" PRIx64 " irq_deferred=%" PRIu64 "\n",
+            env->gxf.gxf_enter_el[1], env->gxf.gxf_status_el[1],
+            env->gxf.gxf_config_el[1], cpu->accel->gxf_irq_deferred);
+
+    if ((esr >> 26) == 0x21 || (esr >> 26) == 0x25) {
+        hvf_hang_walk(cpu, env->cp15.far_el[1]);
+    }
+    /*
+     * When the GL1 vector handler has run far enough to build an exception
+     * frame, the frame holds the *original* exception -- the one that started
+     * the whole chain and which is otherwise overwritten by everything that
+     * happens afterwards. Layout recovered from the handler at VBAR_GL1+0x1000:
+     * ELR at +0x108, SPSR +0x110, FAR +0x118, ESR +0x120.
+     */
+    if ((esr >> 26) == 0x25 && env->cp15.far_el[1] > 0xffffff0000000000ULL) {
+        uint64_t frame = env->cp15.far_el[1] - 8;
+        uint64_t f_elr = 0, f_far = 0;
+        uint32_t f_spsr = 0, f_esr = 0;
+
+        if (cpu_memory_rw_debug(cpu, frame + 0x108, (uint8_t *)&f_elr, 8, 0) == 0 &&
+            cpu_memory_rw_debug(cpu, frame + 0x110, (uint8_t *)&f_spsr, 4, 0) == 0 &&
+            cpu_memory_rw_debug(cpu, frame + 0x118, (uint8_t *)&f_far, 8, 0) == 0 &&
+            cpu_memory_rw_debug(cpu, frame + 0x120, (uint8_t *)&f_esr, 4, 0) == 0) {
+            f_elr = le64_to_cpu(f_elr);
+            f_far = le64_to_cpu(f_far);
+            f_spsr = le32_to_cpu(f_spsr);
+            f_esr = le32_to_cpu(f_esr);
+            fprintf(stderr, "  saved GL1 frame @%#" PRIx64 ": elr=%#018" PRIx64
+                    " spsr=%#010x far=%#018" PRIx64 " esr=%#010x "
+                    "(ec=%#04x iss=%#08x)\n", frame, f_elr, f_spsr, f_far,
+                    f_esr, f_esr >> 26, f_esr & 0x1ffffff);
+        }
+    }
+
+    hvf_ev_dump(cpu);
+    if (hvf_gxf_is_guarded(env)) {
+        fprintf(stderr, "  -- guarded entry point --\n");
+        hvf_hang_walk(cpu, env->gxf.gxf_enter_el[1]);
+        fprintf(stderr, "  -- ppl_dispatch caller (x30) --\n");
+        hvf_hang_walk(cpu, env->xregs[30]);
+    }
+}
+
+static void hvf_hang_tick(void *opaque)
+{
+    CPUState *cpu;
+
+    CPU_FOREACH(cpu) {
+        AccelCPUState *acc = cpu->accel;
+        CPUARMState *env = &ARM_CPU(cpu)->env;
+
+        cpu_synchronize_state(cpu);
+        if (env->pc == acc->hang_last_pc) {
+            if (++acc->hang_ticks == hvf_hang_secs) {
+                hvf_hang_dump(cpu);
+            }
+        } else {
+            acc->hang_last_pc = env->pc;
+            acc->hang_ticks = 0;
+        }
+    }
+    timer_mod(hvf_hang_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1000);
+}
+
 int hvf_arch_init(void)
 {
+    const char *hang = getenv("INFERNO_HVF_HANG_WATCH");
+
+    if (hang) {
+        hvf_hang_secs = atoi(hang);
+        hvf_ev_on = hvf_hang_secs > 0;
+        if (hvf_hang_secs > 0) {
+            hvf_hang_timer = timer_new_ms(QEMU_CLOCK_REALTIME, hvf_hang_tick,
+                                          NULL);
+            timer_mod(hvf_hang_timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1000);
+        }
+    }
+
     hvf_state->vtimer_offset = mach_absolute_time();
     vmstate_register(NULL, 0, &vmstate_hvf_vtimer, &vtimer);
     qemu_add_vm_change_state_handler(hvf_vm_state_change, &vtimer);

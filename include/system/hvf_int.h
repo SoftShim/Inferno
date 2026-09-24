@@ -45,10 +45,19 @@ typedef struct hvf_vcpu_caps {
     uint64_t vmx_cap_preemption_timer;
 } hvf_vcpu_caps;
 
+/*
+ * Upstream fixes this at 32, which the t8030 machine nearly exhausts on its own
+ * (DRAM, SROM, SRAM, SEPROM, DRAM_30/34, the SEP_UNKN* banks, SEPFW_, ...).
+ * The SEP DART mirror (hw/arm/apple-silicon/dart.c) then needs a handful more,
+ * and running out is fatal -- hvf_set_phys_mem() reports "No free slots" and
+ * QEMU exits. Slots are cheap; give the mirror room to breathe.
+ */
+#define HVF_NUM_SLOTS 256
+
 struct HVFState {
     AccelState parent_obj;
 
-    hvf_slot slots[32];
+    hvf_slot slots[HVF_NUM_SLOTS];
     int num_slots;
 
     hvf_vcpu_caps *hvf_caps;
@@ -64,6 +73,37 @@ struct AccelCPUState {
     bool vtimer_masked;
     sigset_t unblock_ipi_mask;
     bool guest_debug_enabled;
+    /*
+     * Apple GXF emulation: while the guest is in GL1, the GL1 register
+     * bank lives in the real EL1 registers and the EL1 bank is stashed
+     * here. See target/arm/hvf/hvf.c.
+     */
+    struct {
+        uint64_t vbar;
+        uint64_t tpidr;
+        uint64_t spsr;
+        uint64_t elr;
+        uint64_t esr;
+        uint64_t far;
+        uint64_t sp_el1;
+    } gxf_el1_saved;
+    /* INFERNO_HVF_HANG_WATCH bookkeeping; see hvf_hang_tick(). */
+    uint64_t hang_last_pc;
+    int hang_ticks;
+    uint64_t gxf_irq_deferred;
+    bool gxf_vtimer_masked;
+    uint64_t gxf_vbar_fixed;
+    uint64_t gxf_sp_fixed;
+    uint64_t gxf_enters;
+    uint64_t gxf_sprr_seen;
+#define HVF_EV_RING 48
+    struct {
+        uint64_t pc;
+        uint64_t aux;
+        uint32_t rep;
+        uint8_t kind;
+    } ev[HVF_EV_RING];
+    uint64_t ev_head;
 #endif
 };
 

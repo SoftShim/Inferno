@@ -64,6 +64,9 @@ typedef struct AppleGFXState {
 void apple_gfx_common_init(Object *obj, AppleGFXState *s, const char* obj_name);
 bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
                               PGDeviceDescriptor *desc, Error **errp);
+@class PGMemoryMapDescriptor;
+PGMemoryMapDescriptor *apple_gfx_new_guest_memory_map(void);
+
 void *apple_gfx_host_ptr_for_gpa_range(uint64_t guest_physical,
                                        uint64_t length, bool read_only,
                                        MemoryRegion **mapping_in_region);

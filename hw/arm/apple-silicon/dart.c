@@ -29,6 +29,7 @@
 #include "qapi/error.h"
 #include "qemu/bitops.h"
 #include "system/dma.h"
+#include "system/hvf.h"
 #include "qobject/qdict.h"
 
 #if 0
@@ -117,8 +118,20 @@ REG32(DART_SID_VALID, 0xFC)
     REG_FIELD(DART_SID_CONFIG, BYPASS_ADDR_39_32, 16, 4)
 #define A_DART_TLB_CONFIG(sid) (0x180 + ((sid) << 2))
 #define R_DART_TLB_CONFIG(sid) (A_DART_TLB_CONFIG(sid) >> 2)
+/*
+ * TTBRs are laid out as DART_MAX_TTBR consecutive registers per stream:
+ *   0x200 + 4 * (DART_MAX_TTBR * sid + idx)
+ * matching Linux's apple-dart (ttbr + 4 * (ttbr_count * sid + idx)) and
+ * confirmed against the guest: XNU's write to 0x2F0 is TTBR[15][0], which is
+ * flat index 60 = 15 * 4.
+ *
+ * The multipliers used to be transposed (DART_MAX_STREAMS * sid + DART_MAX_TTBR
+ * * idx). Only (0, 0) came out right, and the case ranges built from it spanned
+ * 0x200..0x63C -- 272 flat indices into a 64-entry array, so every decoded
+ * register above 0x2FC wrote past the end of regs.ttbr.
+ */
 #define A_DART_TTBR(sid, idx) \
-    (0x200 + (((DART_MAX_STREAMS * (sid)) + (DART_MAX_TTBR * (idx))) << 2))
+    (0x200 + (((DART_MAX_TTBR * (sid)) + (idx)) << 2))
 #define R_DART_TTBR(sid, idx) (A_DART_TTBR(sid, idx) >> 2)
 REG_FIELD(DART_TTBR, VALID, 31, 1)
 #define DART_TTBR_SHIFT (12)
@@ -203,6 +216,16 @@ struct AppleDARTState {
     uint32_t l_shift[3];
     uint64_t sid_mask;
     uint32_t dart_options;
+    /*
+     * HVF mirror (see apple_dart_hvf_mirror_rebuild). -1 disables it.
+     */
+    int32_t hvf_mirror_sid;
+    uint64_t hvf_mirror_size;
+    GPtrArray *hvf_mirror_regions;
+    QEMUTimer *hvf_mirror_timer;
+    uint64_t *hvf_mirror_last;
+    uint32_t hvf_mirror_pages;
+    AppleDARTMapperInstance *hvf_mirror_mapper;
 };
 
 static int apple_dart_device_list(Object *obj, void *opaque)
@@ -255,6 +278,15 @@ static void apple_dart_update_irq(AppleDARTState *dart)
     qemu_irq_lower(dart->irq);
 }
 
+static const char *apple_dart_sep_id(AppleDARTMapperInstance *mapper)
+{
+    const char *id = mapper->common.dart->parent_obj.parent_obj.id;
+
+    return (id != NULL && strstr(id, "sep") != NULL) ? id : NULL;
+}
+
+static void apple_dart_hvf_mirror_rebuild(AppleDARTMapperInstance *mapper);
+
 static void apple_dart_mapper_reg_write(void *opaque, hwaddr addr,
                                         uint64_t data, unsigned size)
 {
@@ -268,6 +300,21 @@ static void apple_dart_mapper_reg_write(void *opaque, hwaddr addr,
     DPRINTF("%s[%d]: (DART) 0x" HWADDR_FMT_plx " <- 0x" HWADDR_FMT_plx "\n",
             mapper->common.dart->parent_obj.parent_obj.id, mapper->common.id,
             addr, data);
+
+    /*
+     * The switch below ends in `default: break;`, so any register this model
+     * does not decode is silently dropped. Log every SEP DART write so an
+     * unhandled one is visible. (The AP *does* install a valid TTBR for SEP --
+     * late, after SID_CONFIG -- followed by a TLB invalidate with sid mask 1.
+     * An earlier note here claimed it never did; that was a trace read too
+     * early in the boot.)
+     */
+    if (getenv("INFERNO_DART_SEP_TRACE") != NULL &&
+        apple_dart_sep_id(mapper) != NULL) {
+        fprintf(stderr, "DART_SEP: reg write [%d] 0x%" HWADDR_PRIx
+                " <- 0x%" PRIx64 " (size %u)\n",
+                mapper->common.id, addr, data, size);
+    }
 
     switch (addr >> 2) {
     case R_DART_TLB_OP:
@@ -311,6 +358,13 @@ static void apple_dart_mapper_reg_write(void *opaque, hwaddr addr,
             }
         }
 
+        /*
+         * An invalidate is the point at which the AP publishes new mappings, so
+         * it is also where the HVF mirror has to be refreshed. XNU invalidates
+         * the SEP stream (sid mask 1) right after installing its TTBR.
+         */
+        apple_dart_hvf_mirror_rebuild(mapper);
+
         qatomic_and(&mapper->regs.tlb_op, ~R_DART_TLB_OP_BUSY_MASK);
         break;
     case R_DART_TLB_OP_SET_0_LOW:
@@ -348,12 +402,23 @@ static void apple_dart_mapper_reg_write(void *opaque, hwaddr addr,
             mapper->regs.sid_config[i] = val;
         }
         break;
-    case R_DART_TTBR(0, 0)...(R_DART_TTBR(DART_MAX_STREAMS, DART_MAX_TTBR) - 1):
+    case R_DART_TTBR(0, 0)...(R_DART_TTBR(DART_MAX_STREAMS, 0) - 1):
         WITH_QEMU_LOCK_GUARD(&mapper->common.mutex)
         {
             i = (addr >> 2) - R_DART_TTBR(0, 0);
             ((uint32_t *)mapper->regs.ttbr)[i] = val;
         }
+        if (getenv("INFERNO_DART_SEP_TRACE") != NULL) {
+            const char *dart_id = mapper->common.dart->parent_obj.parent_obj.id;
+
+            if (dart_id != NULL && strstr(dart_id, "sep") != NULL) {
+                fprintf(stderr,
+                        "DART_SEP: TTBR write idx %u = 0x%" PRIx64
+                        " (valid=%d)\n",
+                        i, val, (int)((val >> 31) & 1));
+            }
+        }
+        apple_dart_hvf_mirror_rebuild(mapper);
         break;
     default:
         break;
@@ -395,7 +460,7 @@ static uint64_t apple_dart_mapper_reg_read(void *opaque, hwaddr addr,
     case R_DART_SID_CONFIG(0)...(R_DART_SID_CONFIG(DART_MAX_STREAMS) - 1):
         i = (addr >> 2) - R_DART_SID_CONFIG(0);
         return mapper->regs.sid_config[i];
-    case R_DART_TTBR(0, 0)...(R_DART_TTBR(DART_MAX_STREAMS, DART_MAX_TTBR) - 1):
+    case R_DART_TTBR(0, 0)...(R_DART_TTBR(DART_MAX_STREAMS, 0) - 1):
         i = (addr >> 2) - R_DART_TTBR(0, 0);
         return ((uint32_t *)mapper->regs.ttbr)[i];
     default:
@@ -502,6 +567,271 @@ static inline uint32_t apple_dart_mapper_ptw(AppleDARTMapperInstance *mapper,
     return 0;
 }
 
+/*
+ * HVF mirror of a DART stream into the *global* address space.
+ *
+ * QEMU models the SEP's DMA window by giving the SEP core a private address
+ * space in which its low 32 MiB is an alias of this DART (`sep_dma` over
+ * `ool_mr`, see sep.c). That is the right model and it works under TCG, where
+ * each CPU really does get its own AddressSpace.
+ *
+ * Under HVF it is silently ineffective. There is exactly one EPT for the whole
+ * VM (accel/hvf/hvf-all.c registers a single listener on address_space_memory),
+ * so a per-vCPU overlay placed on top of RAM never takes effect: the `SEPFW_`
+ * RAM that backs system 0-32 MiB is mapped into the EPT and satisfies the SEP's
+ * accesses directly, without ever consulting this DART. The measured result is
+ * that the SEP reads the firmware image staged at 0x4000 where the AP's
+ * out-of-line message buffers ought to be, and SEPOS's `sks` app rejects every
+ * keystore request with -13 -- which is what blocks data protection.
+ *
+ * The AP's side is entirely correct: it installs a valid TTBR for the SEP
+ * stream and page tables that map, for example, iova 0x4000 -> 0x82A628000.
+ * So rather than fight HVF, publish those same translations as aliases in the
+ * global address space, where HVF *will* map them into the EPT. They are
+ * installed above the `SEPFW_` RAM (priority 1), so any iova the AP has not
+ * mapped still falls through to it -- which is what SEPROM needs, since it
+ * reads the firmware from that RAM before XNU programs the DART at all.
+ */
+static void apple_dart_hvf_mirror_clear(AppleDARTState *dart)
+{
+    if (dart->hvf_mirror_regions == NULL) {
+        return;
+    }
+
+    for (guint i = 0; i < dart->hvf_mirror_regions->len; i++) {
+        MemoryRegion *mr = g_ptr_array_index(dart->hvf_mirror_regions, i);
+
+        memory_region_del_subregion(get_system_memory(), mr);
+        object_unparent(OBJECT(mr));
+    }
+    g_ptr_array_set_size(dart->hvf_mirror_regions, 0);
+}
+
+/*
+ * Walk the stream and publish its translations as aliases. Returns true if the
+ * set of translations changed since the last call.
+ *
+ * This has to be polled rather than driven off register writes. The AP writes
+ * the TTBR and invalidates once, early, while its page tables are still empty,
+ * and from then on it adds mappings by writing PTEs straight into RAM -- across
+ * a whole restore the SEP DART sees exactly twelve register writes and not one
+ * of them accompanies a new buffer. Rebuilding only on register traffic
+ * therefore always runs too early and finds nothing.
+ *
+ * The walk itself is cheap (two loads per page) and the expensive part --
+ * tearing down and re-creating memory regions, which re-flattens the address
+ * space and re-does the EPT mapping -- only happens when something actually
+ * changed.
+ */
+static bool apple_dart_hvf_mirror_walk(AppleDARTMapperInstance *mapper)
+{
+    AppleDARTState *dart = mapper->common.dart;
+    bool trace = getenv("INFERNO_DART_SEP_TRACE") != NULL;
+    uint32_t sid = (uint32_t)dart->hvf_mirror_sid;
+    uint32_t npages = dart->hvf_mirror_size / dart->page_size;
+    g_autofree uint64_t *cur = g_new0(uint64_t, npages);
+    bool changed = false;
+    uint32_t mapped = 0;
+    uint32_t regions = 0;
+    uint32_t n;
+
+    for (n = 0; n < npages; n++) {
+        IOMMUTLBEntry entry = { 0 };
+
+        /*
+         * apple_dart_mapper_ptw() indexes by *page number*, not byte address --
+         * apple_dart_mapper_translate() calls it with `addr >> page_shift`.
+         * Passing a byte address here makes every level index wrong and the
+         * walk silently find nothing.
+         */
+        if (apple_dart_mapper_ptw(mapper, sid, n, &entry) != 0 ||
+            entry.perm == IOMMU_NONE ||
+            entry.translated_addr < dart->hvf_mirror_size) {
+            continue;
+        }
+        cur[n] = entry.translated_addr | 1;
+        mapped++;
+    }
+
+    if (dart->hvf_mirror_last == NULL) {
+        dart->hvf_mirror_last = g_new0(uint64_t, npages);
+        dart->hvf_mirror_pages = npages;
+        changed = mapped != 0;
+    } else {
+        changed = memcmp(dart->hvf_mirror_last, cur,
+                         npages * sizeof(uint64_t)) != 0;
+    }
+
+    if (!changed) {
+        return false;
+    }
+
+    /*
+     * Experiment (INFERNO_DART_MIRROR_STICKY=1): hold on to the previous
+     * mapping when the AP drops everything.
+     *
+     * The AP tears the SEP stream down at `seputil --gigalocker-shutdown` and
+     * never re-arms the TTBR, so from then on the walk legitimately finds
+     * nothing -- and `create_protected_filesystems` runs *after* that point.
+     * Its D-key creation is the one keystore call that needs an out-of-line
+     * payload, which is why it still fails with -13 while the later in-band
+     * commands succeed. Keeping the last good translations alive across the
+     * teardown tests whether that is the whole remaining story.
+     *
+     * Off by default: it is only safe while the AP's buffers stay put, and
+     * nothing guarantees that once it has released the mapping.
+     */
+    if (mapped == 0 && getenv("INFERNO_DART_MIRROR_STICKY") != NULL) {
+        if (trace) {
+            fprintf(stderr,
+                    "DART_SEP: mirror went empty, keeping previous mapping "
+                    "(sticky)\n");
+        }
+        return false;
+    }
+
+    memcpy(dart->hvf_mirror_last, cur, npages * sizeof(uint64_t));
+
+    if (dart->hvf_mirror_regions == NULL) {
+        dart->hvf_mirror_regions = g_ptr_array_new();
+    }
+
+    memory_region_transaction_begin();
+    apple_dart_hvf_mirror_clear(dart);
+
+    /*
+     * Coalesce runs of pages whose translations are contiguous into a single
+     * alias. This is not an optimisation, it is a requirement: the accelerator
+     * keeps a fixed-size table of memory slots, and one region per page exhausts
+     * it ("No free slots", QEMU exits). The AP's mappings are highly contiguous
+     * -- the 16 MiB firmware window arrives as one run of 1044 pages -- so this
+     * turns thousands of regions into a handful.
+     */
+    n = 0;
+    while (n < npages) {
+        hwaddr iova;
+        hwaddr pa;
+        uint32_t run;
+        MemoryRegion *alias;
+        g_autofree char *name = NULL;
+
+        if (cur[n] == 0) {
+            n++;
+            continue;
+        }
+
+        iova = (hwaddr)n * dart->page_size;
+        pa = cur[n] & ~1ULL;
+
+        for (run = 1; n + run < npages; run++) {
+            if (cur[n + run] == 0 ||
+                (cur[n + run] & ~1ULL) != pa + (hwaddr)run * dart->page_size) {
+                break;
+            }
+        }
+
+        name = g_strdup_printf("dart-hvf-mirror@0x%" HWADDR_PRIx, iova);
+        alias = g_new0(MemoryRegion, 1);
+        memory_region_init_alias(alias, OBJECT(dart), name, get_system_memory(),
+                                 pa, (uint64_t)run * dart->page_size);
+        memory_region_add_subregion_overlap(get_system_memory(), iova, alias, 1);
+        g_ptr_array_add(dart->hvf_mirror_regions, alias);
+        regions++;
+
+        if (trace) {
+            fprintf(stderr,
+                    "DART_SEP: mirror iova 0x%" HWADDR_PRIx " -> 0x%"
+                    HWADDR_PRIx " (%u page(s))\n", iova, pa, run);
+        }
+        n += run;
+    }
+    memory_region_transaction_commit();
+
+    if (trace) {
+        fprintf(stderr, "DART_SEP: mirror rebuilt, %u page(s) in %u region(s)\n",
+                mapped, regions);
+    }
+    return true;
+}
+
+#define DART_HVF_MIRROR_POLL_MS 50
+
+static void apple_dart_hvf_mirror_tick(void *opaque)
+{
+    AppleDARTMapperInstance *mapper = opaque;
+    AppleDARTState *dart = mapper->common.dart;
+
+    if (dart->hvf_mirror_sid >= 0 && dart->hvf_mirror_size != 0) {
+        apple_dart_hvf_mirror_walk(mapper);
+    }
+
+    timer_mod(dart->hvf_mirror_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                  DART_HVF_MIRROR_POLL_MS);
+}
+
+static void apple_dart_hvf_mirror_rebuild(AppleDARTMapperInstance *mapper)
+{
+    AppleDARTState *dart = mapper->common.dart;
+
+    if (dart->hvf_mirror_sid < 0 || dart->hvf_mirror_size == 0) {
+        return;
+    }
+
+    dart->hvf_mirror_mapper = mapper;
+    apple_dart_hvf_mirror_walk(mapper);
+
+    if (dart->hvf_mirror_timer == NULL) {
+        dart->hvf_mirror_timer =
+            timer_new_ms(QEMU_CLOCK_VIRTUAL, apple_dart_hvf_mirror_tick,
+                         mapper);
+        timer_mod(dart->hvf_mirror_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                      DART_HVF_MIRROR_POLL_MS);
+    }
+}
+
+/*
+ * Refresh every mirrored stream right now.
+ *
+ * The 50 ms poll is a backstop, not the primary trigger: the AP maps a buffer
+ * and sends the message that refers to it immediately afterwards, so polling
+ * loses the race. Measured on the keystore endpoint, the first six commands
+ * after it is enabled are answered `-13` and the seventh succeeds -- the only
+ * thing that changes in between is the mirror catching up and publishing
+ * iova 0x64000. Refreshing on the way in closes that window.
+ */
+void apple_dart_hvf_mirror_refresh_all(void)
+{
+    GSList *darts = apple_dart_get_device_list();
+    GSList *iter;
+
+    for (iter = darts; iter != NULL; iter = iter->next) {
+        AppleDARTState *dart = APPLE_DART(iter->data);
+
+        if (dart->hvf_mirror_size != 0 && dart->hvf_mirror_mapper != NULL) {
+            apple_dart_hvf_mirror_walk(dart->hvf_mirror_mapper);
+        }
+    }
+    g_slist_free(darts);
+}
+
+void apple_dart_set_hvf_mirror(AppleDARTState *dart, uint32_t sid,
+                               uint64_t size)
+{
+    /*
+     * Only needed under HVF. Under TCG the SEP core's own AddressSpace already
+     * routes these accesses through the DART, and mirroring would additionally
+     * shadow the same addresses for every other CPU.
+     */
+    if (!hvf_enabled()) {
+        return;
+    }
+
+    dart->hvf_mirror_sid = (int32_t)sid;
+    dart->hvf_mirror_size = size;
+}
+
 static IOMMUTLBEntry apple_dart_mapper_translate(IOMMUMemoryRegion *mr,
                                                  hwaddr addr,
                                                  IOMMUAccessFlags flag,
@@ -529,12 +859,26 @@ static IOMMUTLBEntry apple_dart_mapper_translate(IOMMUMemoryRegion *mr,
 
     sid = mapper->regs.sid_remap[sid];
 
-    // Disabled translation means bypass, not error (?)
+    /*
+     * Translation disabled, or FULL_BYPASS set, means the stream bypasses the
+     * DART. This returns a *failed* translation (perm = IOMMU_NONE).
+     *
+     * Tried and reverted (twice): returning an identity mapping with IOMMU_RW.
+     * It looks right -- SEP's own 0-32 MiB is backed by the "SEPFW_" RAM at
+     * system address 0 and is reached through this DART -- but it is wrong in
+     * practice. SEPROM and SEPOS boot fine *while every translation fails*,
+     * and turning pass-through on makes SEPOS fail at boot stage 1. So they do
+     * not reach their firmware through this DART at all; feeding them real
+     * data at those addresses changes what they see and breaks the boot.
+     *
+     * (The first attempt also hung the boot outright, via a separate
+     * self-loop: sep.c aliased `ool_mr` back into system memory at
+     * s->shmbuf_base, which is 0 unless SEP_ENABLE_TRACE_BUFFER is set.)
+     */
     if (REG_FIELD_EX32(mapper->regs.sid_config[sid], DART_SID_CONFIG,
                        TRANSLATION_ENABLE) == 0 ||
         REG_FIELD_EX32(mapper->regs.sid_config[sid], DART_SID_CONFIG,
                        FULL_BYPASS) != 0) {
-        // TODO
         goto end;
     }
 
@@ -573,6 +917,25 @@ static IOMMUTLBEntry apple_dart_mapper_translate(IOMMUMemoryRegion *mr,
     }
 
 end:
+    /*
+     * Targeted diagnostic: the SEP reaches the AP's out-of-line message buffers
+     * through this DART, so a failed translation there is invisible except as
+     * zero reads. INFERNO_DART_SEP_TRACE=1 logs just that DART; the unfiltered
+     * DPRINTF below covers every DART and is far too noisy to leave on.
+     */
+    if (getenv("INFERNO_DART_SEP_TRACE") != NULL) {
+        const char *dart_id = mapper->common.dart->parent_obj.parent_obj.id;
+
+        if (dart_id != NULL && strstr(dart_id, "sep") != NULL) {
+            fprintf(stderr,
+                    "DART_SEP: sid %u iova 0x%" HWADDR_PRIx " -> 0x%" HWADDR_PRIx
+                    " %c%c\n",
+                    iommu->sid, entry.iova, entry.translated_addr,
+                    (entry.perm & IOMMU_RO) ? 'r' : '-',
+                    (entry.perm & IOMMU_WO) ? 'w' : '-');
+        }
+    }
+
     DPRINTF("%s[%d]: (%s) SID %u: 0x" HWADDR_FMT_plx " -> 0x" HWADDR_FMT_plx
             " (%c%c)\n",
             mapper->common.dart->parent_obj.parent_obj.id, mapper->common.id,

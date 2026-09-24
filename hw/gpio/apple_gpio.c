@@ -221,6 +221,23 @@ static void apple_gpio_set(void *opaque, int pin, int level)
         }
     }
 
+    if (getenv("INFERNO_GPIO_LOG")) {
+        static uint32_t logged[1024];
+        uint32_t cfg = s->gpio_cfg[pin] & CFG_MASK;
+        if (logged[pin & 1023] != cfg + 1) {
+            logged[pin & 1023] = cfg + 1;
+            fprintf(stderr, "apple-gpio: pin %d cfg=%s int_grp=%d level=%d\n",
+                    pin,
+                    cfg == CFG_INT_LVL_HI  ? "LVL_HI"  :
+                    cfg == CFG_INT_LVL_LO  ? "LVL_LO"  :
+                    cfg == CFG_INT_EDG_RIS ? "EDG_RIS" :
+                    cfg == CFG_INT_EDG_FAL ? "EDG_FAL" :
+                    cfg == CFG_INT_EDG_ANY ? "EDG_ANY" :
+                    cfg == CFG_GP_IN ? "GP_IN" : cfg == CFG_GP_OUT ? "GP_OUT" : "other",
+                    irqgrp, level);
+        }
+    }
+
     s->in_old[grp] = s->in[grp];
 
     if (irqgrp != -1) {

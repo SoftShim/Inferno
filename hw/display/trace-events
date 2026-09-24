@@ -224,3 +224,5 @@ apple_gfx_iosfc_unmap_memory(void *a, void *b, void *c, void *d, void *e, void *
 apple_gfx_iosfc_unmap_memory_region(void* mem, void *region) "unmapping @ %p from memory region %p"
 apple_gfx_iosfc_raise_irq(uint32_t vector) "vector=0x%x"
 
+apple_gfx_writable_cursor_override(void) "installed PGLocalTask writableCursorFromVirtualOffset:length: override"
+apple_gfx_writable_cursor_first_call(void) "guest asked for its first writable memory cursor"

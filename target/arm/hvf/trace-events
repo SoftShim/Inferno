@@ -14,3 +14,5 @@ hvf_emu_reginfo_write(const char *cpname, const char *regname, uint64_t val) "[%
 hvf_emu_reginfo_read(const char *cpname, const char *regname, uint64_t val) "[%s] read from %s [val=0x%016"PRIx64"]"
 hvf_illegal_guest_state(void) "HV_ILLEGAL_GUEST_STATE"
 hvf_kick_vcpu_thread(unsigned cpuidx, bool stop) "cpu:%u stop:%u"
+hvf_gxf_enter(uint64_t elr, uint64_t pc) "GXF enter: return 0x%"PRIx64" entry 0x%"PRIx64
+hvf_gxf_exit(uint64_t pc) "GXF exit: resume 0x%"PRIx64

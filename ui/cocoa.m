@@ -26,6 +26,7 @@
 
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
+#import <Metal/Metal.h>
 #include <crt_externs.h>
 
 #include "qemu/help-texts.h"
@@ -98,11 +99,39 @@ static DisplayChangeListener dcl = {
     .ops = &dcl_ops,
 };
 static QKbdState *kbd;
-static int cursor_hide = 1;
+/*
+ * Show the host pointer by default. The guest here is a phone: it never calls
+ * dpy_cursor_define, so hiding the arrow on grab left nothing to aim with.
+ * -display cocoa,show-cursor=off restores the old behaviour.
+ */
+static int cursor_hide;
 static int left_command_key_enabled = 1;
 static bool swap_opt_cmd;
 
 static CGInterpolationQuality zoom_interpolation = kCGInterpolationNone;
+/*
+ * Present the guest framebuffer through a CAMetalLayer (texture upload +
+ * GPU scaling) instead of CoreGraphics. Falls back to CoreGraphics when no
+ * Metal device is available. Controlled by -display cocoa,metal=on|off.
+ */
+static bool metal_enabled = true;
+static bool cocoa_dbg_draw;
+static void cocoa_dbg_tick(const char *why);
+
+static NSString *const qemu_metal_shader_src = @
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct VOut { float4 pos [[position]]; float2 uv; };\n"
+    "vertex VOut qemu_vs(uint vid [[vertex_id]]) {\n"
+    "    float2 p[4] = { float2(-1,-1), float2(1,-1), float2(-1,1), float2(1,1) };\n"
+    "    float2 t[4] = { float2(0,1), float2(1,1), float2(0,0), float2(1,0) };\n"
+    "    VOut o; o.pos = float4(p[vid], 0, 1); o.uv = t[vid]; return o;\n"
+    "}\n"
+    "fragment float4 qemu_fs(VOut in [[stage_in]],\n"
+    "                        texture2d<float> tex [[texture(0)]],\n"
+    "                        sampler s [[sampler(0)]]) {\n"
+    "    return float4(tex.sample(s, in.uv).rgb, 1.0);\n"
+    "}\n";
 static NSTextField *pauseLabel;
 
 static bool allow_events;
@@ -326,8 +355,24 @@ static void handleAnyDeviceErrors(Error * err)
     int mouseX;
     int mouseY;
     bool mouseOn;
+    /* Metal presentation path */
+    id<MTLDevice> mtlDevice;
+    id<MTLCommandQueue> mtlQueue;
+    id<MTLRenderPipelineState> mtlPipeline;
+    id<MTLSamplerState> mtlSamplerNearest;
+    id<MTLSamplerState> mtlSamplerLinear;
+    id<MTLTexture> mtlTexture;
+    CAMetalLayer *metalLayer;
+    int metalDirtyY0;
+    int metalDirtyY1;
+    bool renderPending;
 }
 - (void) switchSurface:(pixman_image_t *)image;
+- (void) logMouseEvent:(NSEvent *)event what:(const char *)what down:(bool)down;
+- (void) renderFrame;
+- (void) requestRender;
+- (void) metalMarkDirtyY:(int)y h:(int)h;
+- (BOOL) usesMetal;
 - (void) grabMouse;
 - (void) ungrabMouse;
 - (void) setFullGrab:(id)sender;
@@ -382,7 +427,22 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 #if MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_VERSION_14_0
         [self setClipsToBounds:YES];
 #endif
+        if (metal_enabled) {
+            [self metalSetup];
+        }
         [self setWantsLayer:YES];
+        if (mtlDevice) {
+            /*
+             * AppKit only calls -updateLayer (and therefore only honours
+             * -wantsUpdateLayer) when the redraw policy is
+             * NSViewLayerContentsRedrawOnSetNeedsDisplay. With
+             * ...DuringViewResize it calls -drawRect: instead, which cannot
+             * draw into a framebufferOnly CAMetalLayer -- the window then
+             * stays the layer's black background colour forever.
+             */
+            [self setLayerContentsRedrawPolicy:
+                      NSViewLayerContentsRedrawOnSetNeedsDisplay];
+        }
         cursorLayer = [[CALayer alloc] init];
         [cursorLayer setAnchorPoint:CGPointMake(0, 1)];
         [cursorLayer setAutoresizingMask:kCALayerMaxXMargin |
@@ -408,7 +468,262 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     CGColorSpaceRelease(colorspace);
     [cursorLayer release];
     cursor_unref(cursor);
+    [mtlTexture release];
+    [mtlSamplerNearest release];
+    [mtlSamplerLinear release];
+    [mtlPipeline release];
+    [mtlQueue release];
+    [mtlDevice release];
     [super dealloc];
+}
+
+/*
+ ------------------------------------------------------
+    Metal presentation
+ ------------------------------------------------------
+*/
+- (void) metalSetup
+{
+    NSError *err = nil;
+    id<MTLLibrary> lib;
+    MTLRenderPipelineDescriptor *pd;
+    MTLSamplerDescriptor *sd;
+
+    mtlDevice = MTLCreateSystemDefaultDevice();
+    if (!mtlDevice) {
+        warn_report("cocoa: no Metal device, using CoreGraphics presentation");
+        return;
+    }
+    mtlQueue = [mtlDevice newCommandQueue];
+    lib = [mtlDevice newLibraryWithSource:qemu_metal_shader_src
+                                  options:nil
+                                    error:&err];
+    if (!lib) {
+        warn_report("cocoa: Metal shader compile failed (%s), using "
+                    "CoreGraphics presentation",
+                    [[err localizedDescription] UTF8String]);
+        goto fail;
+    }
+    pd = [[MTLRenderPipelineDescriptor alloc] init];
+    pd.vertexFunction = [lib newFunctionWithName:@"qemu_vs"];
+    pd.fragmentFunction = [lib newFunctionWithName:@"qemu_fs"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    mtlPipeline = [mtlDevice newRenderPipelineStateWithDescriptor:pd
+                                                             error:&err];
+    [pd.vertexFunction release];
+    [pd.fragmentFunction release];
+    [pd release];
+    [lib release];
+    if (!mtlPipeline) {
+        warn_report("cocoa: Metal pipeline creation failed (%s), using "
+                    "CoreGraphics presentation",
+                    [[err localizedDescription] UTF8String]);
+        goto fail;
+    }
+    sd = [[MTLSamplerDescriptor alloc] init];
+    sd.minFilter = MTLSamplerMinMagFilterNearest;
+    sd.magFilter = MTLSamplerMinMagFilterNearest;
+    sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
+    sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+    mtlSamplerNearest = [mtlDevice newSamplerStateWithDescriptor:sd];
+    sd.minFilter = MTLSamplerMinMagFilterLinear;
+    sd.magFilter = MTLSamplerMinMagFilterLinear;
+    mtlSamplerLinear = [mtlDevice newSamplerStateWithDescriptor:sd];
+    [sd release];
+    info_report("cocoa: Metal presentation enabled on %s",
+                [[mtlDevice name] UTF8String]);
+    return;
+
+fail:
+    [mtlQueue release];
+    mtlQueue = nil;
+    [mtlDevice release];
+    mtlDevice = nil;
+}
+
+- (BOOL) usesMetal
+{
+    return mtlDevice != nil;
+}
+
+/* Called from the QEMU UI refresh; coalesces to one blit per main-loop turn. */
+- (void) requestRender
+{
+    if (!mtlDevice || renderPending) {
+        return;
+    }
+    renderPending = true;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self renderFrame];
+    });
+}
+
+- (CALayer *) makeBackingLayer
+{
+    if (!mtlDevice) {
+        return [super makeBackingLayer];
+    }
+    metalLayer = [CAMetalLayer layer];
+    metalLayer.device = mtlDevice;
+    metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    metalLayer.framebufferOnly = YES;
+    metalLayer.opaque = YES;
+    metalLayer.colorspace = colorspace;
+    metalLayer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+    return metalLayer;
+}
+
+- (BOOL) wantsUpdateLayer
+{
+    return mtlDevice != nil;
+}
+
+- (void) metalMarkDirtyY:(int)y h:(int)h
+{
+    if (metalDirtyY0 < 0 || y < metalDirtyY0) {
+        metalDirtyY0 = y;
+    }
+    if (y + h > metalDirtyY1) {
+        metalDirtyY1 = y + h;
+    }
+}
+
+- (void) metalRecreateTexture
+{
+    MTLTextureDescriptor *td;
+
+    [mtlTexture release];
+    mtlTexture = nil;
+    if (!pixman_image) {
+        return;
+    }
+    td = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                     width:pixman_image_get_width(pixman_image)
+                                    height:pixman_image_get_height(pixman_image)
+                                 mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    td.storageMode = mtlDevice.hasUnifiedMemory ? MTLStorageModeShared :
+                                                  MTLStorageModeManaged;
+    mtlTexture = [mtlDevice newTextureWithDescriptor:td];
+    metalDirtyY0 = 0;
+    metalDirtyY1 = pixman_image_get_height(pixman_image);
+}
+
+- (void) metalUploadDirty
+{
+    int h, y0, y1, stride;
+    uint8_t *data;
+
+    if (!mtlTexture || !pixman_image || metalDirtyY0 < 0) {
+        return;
+    }
+    h = pixman_image_get_height(pixman_image);
+    y0 = MAX(metalDirtyY0, 0);
+    y1 = MIN(metalDirtyY1, h);
+    metalDirtyY0 = -1;
+    metalDirtyY1 = 0;
+    if (y1 <= y0) {
+        return;
+    }
+    stride = pixman_image_get_stride(pixman_image);
+    data = (uint8_t *)pixman_image_get_data(pixman_image);
+    [mtlTexture replaceRegion:MTLRegionMake2D(0, y0,
+                                              pixman_image_get_width(pixman_image),
+                                              y1 - y0)
+                  mipmapLevel:0
+                    withBytes:data + (size_t)y0 * stride
+                  bytesPerRow:stride];
+}
+
+static unsigned long cocoa_dbg_update_layer, cocoa_dbg_draw_rect;
+static unsigned long cocoa_dbg_no_drawable, cocoa_dbg_presented;
+
+static void cocoa_dbg_tick(const char *why)
+{
+    static time_t last;
+    time_t now;
+
+    if (!cocoa_dbg_draw) {
+        return;
+    }
+    now = time(NULL);
+    if (now == last) {
+        return;
+    }
+    last = now;
+    fprintf(stderr, "cocoa-dbg[%s]: updateLayer=%lu drawRect=%lu "
+            "nodrawable=%lu presented=%lu\n", why,
+            cocoa_dbg_update_layer, cocoa_dbg_draw_rect,
+            cocoa_dbg_no_drawable, cocoa_dbg_presented);
+}
+
+- (void) updateLayer
+{
+    ++cocoa_dbg_update_layer;
+    cocoa_dbg_tick("upd");
+    [self renderFrame];
+}
+
+/*
+ * AppKit never runs its draw cycle for this view: the backing layer is a
+ * CAMetalLayer, so neither -drawRect: nor -updateLayer is called (verified
+ * with the counters above -- both stayed at zero for a whole boot). Drive the
+ * blit ourselves from the UI refresh instead of waiting to be asked.
+ */
+- (void) renderFrame
+{
+    id<CAMetalDrawable> drawable;
+    id<MTLCommandBuffer> cb;
+    id<MTLRenderCommandEncoder> enc;
+    MTLRenderPassDescriptor *rp;
+    NSSize backing;
+
+    renderPending = false;
+    cocoa_dbg_tick("frame");
+    if (!mtlDevice || !metalLayer) {
+        return;
+    }
+
+    backing = [self convertSizeToBacking:[self bounds].size];
+    if (backing.width < 1 || backing.height < 1) {
+        return;
+    }
+    if (metalLayer.drawableSize.width != backing.width ||
+        metalLayer.drawableSize.height != backing.height) {
+        metalLayer.contentsScale = [[self window] backingScaleFactor];
+        metalLayer.drawableSize = CGSizeMake(backing.width, backing.height);
+    }
+
+    [self metalUploadDirty];
+
+    drawable = [metalLayer nextDrawable];
+    if (!drawable) {
+        ++cocoa_dbg_no_drawable;
+        return;
+    }
+    rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = drawable.texture;
+    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+    cb = [mtlQueue commandBuffer];
+    enc = [cb renderCommandEncoderWithDescriptor:rp];
+    if (mtlTexture) {
+        [enc setRenderPipelineState:mtlPipeline];
+        [enc setFragmentTexture:mtlTexture atIndex:0];
+        [enc setFragmentSamplerState:(zoom_interpolation == kCGInterpolationNone ?
+                                      mtlSamplerNearest : mtlSamplerLinear)
+                             atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip
+                vertexStart:0
+                vertexCount:4];
+    }
+    [enc endEncoding];
+    [cb presentDrawable:drawable];
+    [cb commit];
+    ++cocoa_dbg_presented;
 }
 
 - (BOOL) isOpaque
@@ -522,6 +837,9 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 {
     COCOA_DEBUG("QemuCocoaView: drawRect\n");
 
+    ++cocoa_dbg_draw_rect;
+    cocoa_dbg_tick("rect");
+
     // get CoreGraphic context
     CGContextRef viewContextRef = [[NSGraphicsContext currentContext] CGContext];
 
@@ -618,6 +936,25 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     return fixed;
 }
 
+/*
+ * The largest content size that still fits on the screen the window is on,
+ * leaving room for the menu bar, the Dock and our own title bar.
+ */
+- (NSSize) screenFitSize
+{
+    /* [window screen] is nil until the window is ordered front. */
+    NSScreen *scr = [[self window] screen] ?: [NSScreen mainScreen];
+    NSSize size = [scr visibleFrame].size;
+    NSRect content;
+
+    if (size.width < 1 || size.height < 1) {
+        return NSMakeSize(screen.width, screen.height);
+    }
+    content = [[self window] contentRectForFrameRect:
+                   NSMakeRect(0, 0, size.width, size.height)];
+    return content.size;
+}
+
 - (NSSize) screenSafeAreaSize
 {
     NSSize size = [[[self window] screen] frame].size;
@@ -638,7 +975,20 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         [[self window] setContentSize:[self fixAspectRatio:[self screenSafeAreaSize]]];
         [[self window] center];
     } else {
-        [[self window] setContentSize:[self fixAspectRatio:[self frame].size]];
+        /*
+         * Show the guest at its native size when it fits, otherwise scale it
+         * down to the screen -- 828x1792 is taller than most Macs, and the old
+         * area-preserving fit off the initial 640x480 frame produced a window
+         * of an unrelated size.
+         */
+        NSSize want = NSMakeSize(screen.width, screen.height);
+        NSSize max = [self screenFitSize];
+
+        if (want.width > max.width || want.height > max.height) {
+            want = [self fixAspectRatio:max];
+        }
+        [[self window] setContentSize:want];
+        [[self window] center];
     }
 }
 
@@ -739,6 +1089,32 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     }
 
     pixman_image = image;
+
+    if (mtlDevice) {
+        [self metalRecreateTexture];
+        [self setNeedsDisplay:YES];
+        [self renderFrame];
+    }
+}
+
+- (void) setFrameSize:(NSSize)newSize
+{
+    [super setFrameSize:newSize];
+    if (mtlDevice && pixman_image) {
+        metalDirtyY0 = 0;
+        metalDirtyY1 = pixman_image_get_height(pixman_image);
+        [self renderFrame];
+    }
+}
+
+- (void) viewDidChangeBackingProperties
+{
+    [super viewDidChangeBackingProperties];
+    if (mtlDevice && pixman_image) {
+        metalDirtyY0 = 0;
+        metalDirtyY1 = pixman_image_get_height(pixman_image);
+        [self renderFrame];
+    }
 }
 
 - (void) setFullGrab:(id)sender
@@ -1078,8 +1454,36 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     }
 }
 
+- (void) logMouseEvent:(NSEvent *)event what:(const char *)what down:(bool)down
+{
+    static double last_down_ts;
+    static NSPoint last_down_pt;
+    NSPoint p = [event locationInWindow];
+
+    if (!cocoa_dbg_draw) {
+        return;
+    }
+    if (down) {
+        last_down_ts = [event timestamp];
+        last_down_pt = p;
+        fprintf(stderr, "cocoa-mouse[%s] DOWN at (%.0f,%.0f) clicks=%ld "
+                "pressure=%.2f grabbed=%d\n", what, p.x, p.y,
+                (long)[event clickCount], [event pressure], (int)isMouseGrabbed);
+    } else {
+        fprintf(stderr, "cocoa-mouse[%s] UP   at (%.0f,%.0f) held=%.0fms "
+                "moved=%.0fpt grabbed=%d\n", what, p.x, p.y,
+                ([event timestamp] - last_down_ts) * 1000.0,
+                hypot(p.x - last_down_pt.x, p.y - last_down_pt.y),
+                (int)isMouseGrabbed);
+    }
+}
+
 - (void) handleMouseEvent:(NSEvent *)event button:(InputButton)button down:(bool)down
 {
+    [self logMouseEvent:event
+                   what:(button == INPUT_BUTTON_LEFT ? "left" : "other")
+                   down:down];
+
     if (!isMouseGrabbed) {
         return;
     }
@@ -1300,8 +1704,14 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         }
 
         // create a window
+        /*
+         * Resizable by default. -setContentAspectRatio: in -resizeWindow pins
+         * the ratio, so dragging any edge scales the guest output instead of
+         * letterboxing it. The View menu can still take the mask away.
+         */
         window = [[NSWindow alloc] initWithContentRect:[cocoaView frame]
-            styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskMiniaturizable|NSWindowStyleMaskClosable
+            styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskMiniaturizable|
+                      NSWindowStyleMaskClosable|NSWindowStyleMaskResizable
             backing:NSBackingStoreBuffered defer:NO];
         if(!window) {
             error_report("(cocoa) can't create window");
@@ -1501,6 +1911,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         zoom_interpolation = kCGInterpolationNone;
         [sender setState: NSControlStateValueOff];
     }
+    [cocoaView setNeedsDisplay:YES];
 }
 
 /* Displays the console on the screen */
@@ -2034,6 +2445,18 @@ static void cocoa_update(DisplayChangeListener *dcl,
 
     dispatch_async(dispatch_get_main_queue(), ^{
         NSRect rect = NSMakeRect(x, [cocoaView gscreen].height - y - h, w, h);
+        if ([cocoaView usesMetal]) {
+            [cocoaView metalMarkDirtyY:y h:h];
+            /*
+             * AppKit never runs the draw cycle for a CAMetalLayer backing
+             * layer, so present here rather than waiting to be asked. Doing it
+             * on guest updates only (not on every UI refresh tick) matters:
+             * apple-gfx hands PVG this same main queue for its display
+             * callbacks, and -nextDrawable blocks, so a free-running blit
+             * starves the GPU bring-up handshake and the boot wedges.
+             */
+            [cocoaView renderFrame];
+        }
         [cocoaView setNeedsDisplayInRect:rect];
     });
 }
@@ -2094,9 +2517,15 @@ static void cocoa_cursor_define(DisplayChangeListener *dcl, QEMUCursor *cursor)
 
 static void cocoa_display_init(DisplayState *ds, DisplayOptions *opts)
 {
+    cocoa_dbg_draw = getenv("INFERNO_COCOA_DEBUG") != NULL;
     NSAutoreleasePool * pool = [[NSAutoreleasePool alloc] init];
 
     COCOA_DEBUG("qemu_cocoa: cocoa_display_init\n");
+
+    /* Must be decided before the view (and its backing layer) is created. */
+    if (opts->u.cocoa.has_metal) {
+        metal_enabled = opts->u.cocoa.metal;
+    }
 
     // Pull this console process up to being a fully-fledged graphical
     // app with a menubar and Dock icon
@@ -2117,8 +2546,8 @@ static void cocoa_display_init(DisplayState *ds, DisplayOptions *opts)
         [controller setFullGrab: nil];
     }
 
-    if (opts->has_show_cursor && opts->show_cursor) {
-        cursor_hide = 0;
+    if (opts->has_show_cursor) {
+        cursor_hide = !opts->show_cursor;
     }
     if (opts->u.cocoa.has_swap_opt_cmd) {
         swap_opt_cmd = opts->u.cocoa.swap_opt_cmd;

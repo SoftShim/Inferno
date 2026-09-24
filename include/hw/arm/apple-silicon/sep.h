@@ -364,6 +364,7 @@ struct AppleSEPState {
     hwaddr trace_buffer_base_offset;
     hwaddr debug_trace_size;
     gchar *fw_data;
+    bool fw_mapped;
     bool pmgr_fuse_changer_bit0_was_set;
     bool pmgr_fuse_changer_bit1_was_set;
     uint8_t key_fcfg_offset_0x14_index;

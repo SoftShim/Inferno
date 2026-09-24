@@ -1443,6 +1443,11 @@
 # @zoom-interpolation: Apply interpolation to smooth output when
 #     zoom-to-fit is enabled.  Defaults to "off".  (Since 9.0)
 #
+# @metal: Present the guest display through a Metal-backed layer
+#     (GPU texture upload and scaling) instead of CoreGraphics.  Falls
+#     back to CoreGraphics when no Metal device is available.  Defaults
+#     to "on".  (Since 10.2)
+#
 # Since: 7.0
 ##
 { 'struct': 'DisplayCocoa',
@@ -1451,7 +1456,8 @@
       '*full-grab': 'bool',
       '*swap-opt-cmd': 'bool',
       '*zoom-to-fit': 'bool',
-      '*zoom-interpolation': 'bool'
+      '*zoom-interpolation': 'bool',
+      '*metal': 'bool'
   } }
 
 ##

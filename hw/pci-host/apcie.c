@@ -34,6 +34,7 @@
 #include "hw/qdev-properties.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
+#include "system/system.h"
 
 // #define DEBUG_APCIE
 
@@ -1452,6 +1453,43 @@ static void apple_pcie_host_reset(DeviceState *dev)
     memset(host->root_common_regs, 0, sizeof(host->root_common_regs));
 }
 
+static bool apple_pcie_port_is_occupied(ApplePCIEPort *port)
+{
+    PCIBus *sec_bus = pci_bridge_get_sec_bus(PCI_BRIDGE(PCI_DEVICE(port)));
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(sec_bus->devices); i++) {
+        if (sec_bus->devices[i] != NULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void apple_pcie_hide_unused_ports(Notifier *notifier, void *data)
+{
+    ApplePCIEState *s = container_of(notifier, ApplePCIEState, machine_done);
+    bool t802x = s->chip_id == 0x8015 || s->chip_id == 0x8020 ||
+                 s->chip_id == 0x8030;
+    int spare = t802x ? 1 : 3;
+    int i;
+
+    /*
+     * Port 0 carries the internal ANS2 NVMe controller, which iOS drives
+     * through its own device tree node rather than over PCI, so it stays
+     * hidden unconditionally the way it always was.
+     */
+    if (t802x) {
+        pci_set_power(PCI_DEVICE(s->ports[0]), false);
+    }
+
+    /* The spare port is only hidden when nothing is plugged into it. */
+    if (s->ports[spare] != NULL &&
+        !apple_pcie_port_is_occupied(s->ports[spare])) {
+        pci_set_power(PCI_DEVICE(s->ports[spare]), false);
+    }
+}
+
 static ApplePCIEPort *apple_pcie_create_port(AppleDTNode *node, uint32_t bus_nr,
                                              qemu_irq irq, PCIBus *bus,
                                              ApplePCIEHost *host)
@@ -1820,14 +1858,19 @@ SysBusDevice *apple_pcie_from_node(AppleDTNode *node, uint32_t chip_id)
         }
     }
 
-    if (chip_id == 0x8015 || chip_id == 0x8020 || chip_id == 0x8030) {
-        pci_set_power(PCI_DEVICE(s->ports[0]), false);
-        pci_set_power(PCI_DEVICE(s->ports[1]), false);
-        // pci_set_power(PCI_DEVICE(s->ports[2]), false);
-        // pci_set_power(PCI_DEVICE(s->ports[3]), false);
-    } else {
-        pci_set_power(PCI_DEVICE(s->ports[3]), false);
-    }
+    /*
+     * Hide the root ports the SoC does not wire up on this board, but only
+     * once the command line has been fully processed: `-device foo,bus=
+     * apple-pcie.N` attaches during machine init, which is after this
+     * function runs. Powering a port off unconditionally here made every
+     * device behind ports 0 and 1 unreachable -- their config space read back
+     * as all-ones -- even though `info pci` happily listed them. Deciding at
+     * machine-init-done time instead keeps the stock t8030 layout (only
+     * pci-bridge2 and pci-bridge3 exist in the device tree) while letting an
+     * otherwise unused port carry an extra device.
+     */
+    s->machine_done.notify = apple_pcie_hide_unused_ports;
+    qemu_add_machine_init_done_notifier(&s->machine_done);
 
     DPRINTF("%s: reg[1] == 0x" HWADDR_FMT_plx "\n", __func__, reg[1]);
 
@@ -1928,7 +1971,16 @@ static void apple_pcie_port_realize(DeviceState *dev, Error **errp)
     // MemoryRegion *host_mem = get_system_memory();
     //  MemoryRegion *address_space = &host->pci.memory;
     PCIBridge *br = PCI_BRIDGE(pci);
-    br->bus_name = "apple-pcie";
+    /*
+     * Name each root port's secondary bus after its port number, so a device
+     * can be attached to a *specific* port with `-device ...,bus=apple-pcie.N`.
+     * Every port used to expose a bus called "apple-pcie", so -device could
+     * only ever land on the first one. That matters because the t8030 device
+     * tree only describes pci-bridge2 and pci-bridge3; a device behind any
+     * other port is enumerated by QEMU but invisible to the guest, which sees
+     * "[ PCI configuration end, bridges 3, devices 0 ]".
+     */
+    br->bus_name = g_strdup_printf("apple-pcie.%u", port->bus_nr);
 
     /* Set unique chassis/slot values for the root port */
     qdev_prop_set_uint8(dev, "chassis", 0);
@@ -1998,6 +2050,20 @@ static void apple_pcie_port_realize(DeviceState *dev, Error **errp)
     DPRINTF("%s: slot->width == %u ; slot->speed == %u\n", __func__,
             slot->width, slot->speed);
     pcie_cap_fill_link_ep_usp(pci, slot->width, slot->speed);
+
+    /*
+     * Advertise that we can report Data Link Layer Link Active, and report it
+     * as active. iOS's IOPCIFamily will not assign a secondary bus number to a
+     * root port whose data link is not active, so without this it stops right
+     * after discovering the bridges -- "[ PCI configuration end, bridges 3,
+     * devices 0 ]" -- and never scans bus 1, leaving any device behind the port
+     * invisible to the guest. pcie_cap_fill_link_ep_usp() above only fills in
+     * the negotiated link width and current link speed, not DLLLA.
+     */
+    pci_long_test_and_set_mask(pci->config + pci->exp.exp_cap + PCI_EXP_LNKCAP,
+                               PCI_EXP_LNKCAP_DLLLARC);
+    pci_word_test_and_set_mask(pci->config + pci->exp.exp_cap + PCI_EXP_LNKSTA,
+                               PCI_EXP_LNKSTA_DLLLA);
 #endif
 
 #if 1

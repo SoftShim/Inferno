@@ -17,6 +17,7 @@
 #include "qemu/log.h"
 #include "qapi/visitor.h"
 #include "qapi/error.h"
+#include "qemu/error-report.h"
 #include "block/aio-wait.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
@@ -28,8 +29,55 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <dispatch/dispatch.h>
+#include <execinfo.h>
+#include <signal.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
 
 #import <ParavirtualizedGraphics/ParavirtualizedGraphics.h>
+
+/*
+ * ParavirtualizedGraphics.framework aborts outright when the guest drives a
+ * code path this host version no longer implements -- macOS 26's
+ * -[PGBaseTask writableCursorFromVirtualOffset:length:] is four instructions
+ * ending in abort(). QEMU carries com.apple.security.hypervisor, so
+ * DYLD_INSERT_LIBRARIES is ignored and attaching lldb makes the debugger the
+ * task's Mach exception handler, which stalls HVF. Printing the backtrace from
+ * inside the process is the only way left to see which call aborted. Opt in
+ * with INFERNO_ABORT_BT=1.
+ */
+static void apple_gfx_fatal_signal(int sig)
+{
+    void *frames[64];
+    char header[64];
+    int n = backtrace(frames, ARRAY_SIZE(frames));
+    int len = snprintf(header, sizeof(header),
+                       "\n=== INFERNO signal %d, %d frames ===\n", sig, n);
+
+    write(STDERR_FILENO, header, len);
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void __attribute__((constructor)) apple_gfx_install_signal_handler(void)
+{
+    struct sigaction sa;
+    int sigs[] = { SIGABRT, SIGILL, SIGTRAP };
+    size_t i;
+
+    if (getenv("INFERNO_ABORT_BT") == NULL) {
+        return;
+    }
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = apple_gfx_fatal_signal;
+    sa.sa_flags = SA_NODEFER | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    for (i = 0; i < ARRAY_SIZE(sigs); i++) {
+        sigaction(sigs[i], &sa, NULL);
+    }
+}
 
 static const AppleGFXDisplayMode apple_gfx_default_modes[] = {
     { 1920, 1080, 60 },
@@ -498,13 +546,58 @@ typedef struct AppleGFXIOJob {
     uint64_t offset;
     uint64_t value;
     bool completed;
+    QemuEvent done;
 } AppleGFXIOJob;
+
+/*
+ * Wait for a PVG MMIO call without holding the BQL.
+ *
+ * AIO_WAIT_WHILE() keeps the BQL while it polls, which deadlocks the whole VM:
+ * PGDevice's mmioReadAtOffset:/mmioWriteAtOffset: can block until the guest's
+ * command FIFO advances (PVG's own PGFifoThreads sit in
+ * -[PGChildFIFO getFifoBytes:into:] waiting for exactly that), but the FIFO can
+ * only advance if another vCPU runs, and every other vCPU is queued on the BQL
+ * behind this one. The main loop is queued there too, so QMP and the display
+ * die with it -- the VM goes to 0% CPU and cannot even be inspected.
+ *
+ * Seen after heavy compositing (following a link, then scrolling): the guest
+ * spin-polls status registers 0x1014/0x1018/0x102c, which read 0 forever, and
+ * then one read never returns at all.
+ *
+ * Dropping the BQL lets the other vCPUs keep feeding the FIFO, so the mutual
+ * wait resolves; and if PVG really is stuck, the VM stays alive and
+ * inspectable instead of freezing outright. Callbacks that need the BQL take
+ * it themselves or post BHs, which the main loop now runs.
+ * INFERNO_PVG_LOCKED_MMIO=1 restores the old behaviour.
+ */
+static bool apple_gfx_unlocked_mmio(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("INFERNO_PVG_LOCKED_MMIO");
+        on = !(e != NULL && atoi(e) != 0);
+    }
+    return on;
+}
+
+static void apple_gfx_wait_job(AppleGFXIOJob *job)
+{
+    if (!apple_gfx_unlocked_mmio()) {
+        AIO_WAIT_WHILE(NULL, !qatomic_read(&job->completed));
+        return;
+    }
+    bql_unlock();
+    qemu_event_wait(&job->done);
+    bql_lock();
+}
 
 static void apple_gfx_do_read(void *opaque)
 {
     AppleGFXIOJob *job = opaque;
     job->value = [job->state->pgdev mmioReadAtOffset:job->offset];
     qatomic_set(&job->completed, true);
+    qemu_event_set(&job->done);
     aio_wait_kick();
 }
 
@@ -517,8 +610,10 @@ static uint64_t apple_gfx_read(void *opaque, hwaddr offset, unsigned size)
     };
     dispatch_queue_t queue = get_background_queue();
 
+    qemu_event_init(&job.done, false);
     dispatch_async_f(queue, &job, apple_gfx_do_read);
-    AIO_WAIT_WHILE(NULL, !qatomic_read(&job.completed));
+    apple_gfx_wait_job(&job);
+    qemu_event_destroy(&job.done);
 
     trace_apple_gfx_read(offset, job.value);
     return job.value;
@@ -529,6 +624,7 @@ static void apple_gfx_do_write(void *opaque)
     AppleGFXIOJob *job = opaque;
     [job->state->pgdev mmioWriteAtOffset:job->offset value:job->value];
     qatomic_set(&job->completed, true);
+    qemu_event_set(&job->done);
     aio_wait_kick();
 }
 
@@ -552,8 +648,10 @@ static void apple_gfx_write(void *opaque, hwaddr offset, uint64_t val,
     };
     dispatch_queue_t queue = get_background_queue();
 
+    qemu_event_init(&job.done, false);
     dispatch_async_f(queue, &job, apple_gfx_do_write);
-    AIO_WAIT_WHILE(NULL, !qatomic_read(&job.completed));
+    apple_gfx_wait_job(&job);
+    qemu_event_destroy(&job.done);
 
     trace_apple_gfx_write(offset, val);
 }
@@ -581,6 +679,195 @@ static size_t apple_gfx_get_default_mmio_range_size(void)
         [desc release];
     }
     return mmio_range_size;
+}
+
+/*
+ * macOS 26's ParavirtualizedGraphics dropped PGIOSurfaceHostDeviceDescriptor's
+ * mapMemory/unmapMemory blocks. Instead the VMM declares the guest's physical
+ * memory up front through a PGMemoryMapDescriptor and the framework resolves
+ * addresses itself. Setting the old properties on the new framework throws
+ * "-[PGIOSurfaceHostDeviceDescriptor setMapMemory:]: unrecognized selector",
+ * which aborts QEMU during realize. The declarations below cover the new API;
+ * the framework header this file was written against predates it.
+ *
+ * PGGuestPhysicalRange_s is {uint64_t, uint64_t, void *}, taken from the
+ * runtime type encoding of -[PGMemoryMapDescriptor addRange:]:
+ *   v40@0:8{PGGuestPhysicalRange_s=QQ^v}16
+ */
+typedef struct PGGuestPhysicalRange_s {
+    uint64_t physicalAddress;
+    uint64_t physicalLength;
+    void *hostVirtualAddress;
+} PGGuestPhysicalRange_s;
+
+@interface PGMemoryMapDescriptor : NSObject
+- (void)addRange:(PGGuestPhysicalRange_s)range;
+@end
+
+@interface PGDeviceDescriptor (AppleGFXModernMemoryMap)
+@property (readwrite, nonatomic, strong, nullable)
+    PGMemoryMapDescriptor *memoryMapDescriptor;
+@end
+
+static bool apple_gfx_find_guest_dram(Int128 start, Int128 len,
+                                      const MemoryRegion *mr,
+                                      hwaddr offset_in_region, void *opaque)
+{
+    PGGuestPhysicalRange_s *biggest = (PGGuestPhysicalRange_s *)opaque;
+    size_t page = qemu_real_host_page_size();
+    void *host_ptr;
+
+    if (!memory_region_is_ram(mr) || memory_region_is_rom(mr) ||
+        memory_region_is_romd(mr)) {
+        return false;
+    }
+
+    host_ptr = memory_region_get_ram_ptr((MemoryRegion *)mr);
+    if (host_ptr == NULL) {
+        return false;
+    }
+    host_ptr = (char *)host_ptr + offset_in_region;
+
+    /*
+     * The framework wraps each range in an XPC shared memory object, which
+     * traps inside _xpc_api_misuse() for anything that is not a page aligned,
+     * page sized mapping. Plenty of QEMU "RAM" regions are really register
+     * backing store -- apple-spmi.fault_counter_reg is 0x64 bytes at an
+     * unaligned host address -- and handing those over aborts QEMU during
+     * realize.
+     */
+    if (!QEMU_IS_ALIGNED(int128_get64(start), page) ||
+        !QEMU_IS_ALIGNED(int128_get64(len), page) ||
+        !QEMU_PTR_IS_ALIGNED(host_ptr, page) || int128_get64(len) < page) {
+        return false;
+    }
+
+    if (int128_get64(len) > biggest->physicalLength) {
+        biggest->physicalAddress = int128_get64(start);
+        biggest->physicalLength = int128_get64(len);
+        biggest->hostVirtualAddress = host_ptr;
+    }
+    return false;
+}
+
+/*
+ * Describe the guest's DRAM to the framework. It is the largest RAM range in
+ * the address space and the only one the GPU ever touches, because that is
+ * where IOSurfaces live. Both the GPU device and the IOSurface host device
+ * need it, so the caller owns the returned descriptor.
+ */
+PGMemoryMapDescriptor *apple_gfx_new_guest_memory_map(void)
+{
+    PGMemoryMapDescriptor *map_desc = [PGMemoryMapDescriptor new];
+    PGGuestPhysicalRange_s dram = { 0, 0, NULL };
+
+    WITH_RCU_READ_LOCK_GUARD() {
+        flatview_for_each_range(
+            address_space_to_flatview(&address_space_memory),
+            apple_gfx_find_guest_dram, &dram);
+    }
+
+    if (dram.physicalLength != 0) {
+        [map_desc addRange:dram];
+        trace_apple_gfx_iosfc_map_memory(dram.physicalAddress,
+                                         dram.physicalLength, false,
+                                         &dram.hostVirtualAddress, NULL, NULL,
+                                         dram.hostVirtualAddress);
+    }
+    return map_desc;
+}
+
+/*
+ * macOS 26 never finished porting the guest-virtual buffer path to the new
+ * memory-map model. PGLocalTask overrides every other PGBaseTask primitive but
+ * not -writableCursorFromVirtualOffset:length:, so it inherits the abstract
+ * base's four-instruction abort() stub, and the moment the guest asks for a
+ * writable cursor into one of its own buffers QEMU dies:
+ *
+ *   PGResourceManager::newWritableMemoryCursorForBuffer
+ *   -[PGResourceManagerDelegate newMemoryCursorForBuffer:]
+ *   -[PGDeserializerRenderDecoder decodeGetTileDimensionsWithCursor:]
+ *   ... -[PGFIFO processFifo]
+ *
+ * PGLocalTask does implement the general form,
+ * -cursorFromVirtualOffsetInternal:length:needWritable:, which the read-only
+ * -cursorFromVirtualOffset:length: is a wrapper around. Supply the missing
+ * override as a wrapper around the same call with needWritable set.
+ *
+ * The method returns a std::shared_ptr, so it uses the indirect return
+ * convention -- the caller's buffer arrives in x8, which no C prototype can
+ * express. A tail call leaves x0 (self), x2 (offset), x3 (length) and x8
+ * exactly as they arrived and only rewrites the selector and the extra
+ * argument, so the ABI stays the framework's own.
+ */
+static SEL apple_gfx_cursor_internal_sel;
+static uint64_t apple_gfx_cursor_calls;
+
+/*
+ * Count the calls and say so the first time, because "is the guest even
+ * reaching this?" is the first question to ask when a boot stalls with the
+ * override installed. Everything is saved and restored around the call so the
+ * tail call still hands the framework exactly what it was given, x8 included.
+ */
+void apple_gfx_writable_cursor_entered(void);
+void apple_gfx_writable_cursor_entered(void)
+{
+    if (apple_gfx_cursor_calls++ == 0) {
+        trace_apple_gfx_writable_cursor_first_call();
+    }
+}
+
+__asm__(
+    ".text\n"
+    ".p2align 2\n"
+    ".private_extern _apple_gfx_writable_cursor_thunk\n"
+    "_apple_gfx_writable_cursor_thunk:\n"
+    "    stp  x29, x30, [sp, #-0x40]!\n"
+    "    mov  x29, sp\n"
+    "    stp  x0, x1, [sp, #0x10]\n"
+    "    stp  x2, x3, [sp, #0x20]\n"
+    "    stp  x4, x8, [sp, #0x30]\n"
+    "    bl   _apple_gfx_writable_cursor_entered\n"
+    "    ldp  x0, x1, [sp, #0x10]\n"
+    "    ldp  x2, x3, [sp, #0x20]\n"
+    "    ldp  x4, x8, [sp, #0x30]\n"
+    "    ldp  x29, x30, [sp], #0x40\n"
+    "    adrp x1, _apple_gfx_cursor_internal_sel@PAGE\n"
+    "    ldr  x1, [x1, _apple_gfx_cursor_internal_sel@PAGEOFF]\n"
+    "    mov  w4, #1\n"
+    "    b    _objc_msgSend\n"
+);
+
+extern void apple_gfx_writable_cursor_thunk(void);
+
+static void apple_gfx_add_writable_cursor_override(void)
+{
+    static const char *kWritable = "writableCursorFromVirtualOffset:length:";
+    static const char *kInternal =
+        "cursorFromVirtualOffsetInternal:length:needWritable:";
+    Class task_class = NSClassFromString(@"PGLocalTask");
+    SEL writable = sel_registerName(kWritable);
+
+    /* Opt out to find out whether a stall is on this side of the boundary. */
+    if (task_class == nil || getenv("INFERNO_NO_CURSOR_FIX") != NULL) {
+        return;
+    }
+    /* A host that ships its own override needs nothing from us. */
+    if (class_getInstanceMethod(task_class, writable) !=
+        class_getInstanceMethod(objc_getClass("PGBaseTask"), writable)) {
+        return;
+    }
+    apple_gfx_cursor_internal_sel = sel_registerName(kInternal);
+    if (class_getInstanceMethod(task_class, apple_gfx_cursor_internal_sel) == NULL) {
+        warn_report("apple-gfx: PGLocalTask has neither %s nor %s; "
+                    "guest buffer writes will abort", kWritable, kInternal);
+        return;
+    }
+    if (class_addMethod(task_class, writable,
+                        (IMP)apple_gfx_writable_cursor_thunk,
+                        "{?=^v^v}32@0:8Q16Q24")) {
+        trace_apple_gfx_writable_cursor_override();
+    }
 }
 
 /* ------ Initialisation and startup ------ */
@@ -649,12 +936,45 @@ static void new_frame_handler_bh(void *opaque)
     }
 }
 
+/*
+ * Neither of these is declared in the framework headers we have, but both
+ * exist (confirmed with data/hosttrap/pgtypes):
+ *   PGDisplayDescriptor -setConnectionType:        v20@0:8i16
+ *   PGDeviceDescriptor  -setExternalDisplayPortMask: v20@0:8I16
+ * Left at their defaults, iOS classifies the paravirtual display as an
+ * external monitor: backboardd then keeps the built-in touchscreen on a
+ * separate <main> display while every SpringBoard scene lives on this one,
+ * whose BKDirectTouchPerDisplayInfo has `digitizers: <nil>`, so touches never
+ * reach any view.
+ */
+@interface PGDisplayDescriptor (InfernoConnectionType)
+- (void)setConnectionType:(int)type;
+@end
+
 static PGDisplayDescriptor *apple_gfx_prepare_display_descriptor(AppleGFXState *s)
 {
     PGDisplayDescriptor *disp_desc = [PGDisplayDescriptor new];
 
     disp_desc.name = @"QEMU display";
-    disp_desc.sizeInMillimeters = NSMakeSize(400., 300.); /* A 20" display */
+    /*
+     * Physical panel size. The upstream 400x300mm ("a 20 inch display") makes
+     * iOS classify this as an external monitor rather than the built-in panel,
+     * and the built-in touchscreen is then bound to a *different* display than
+     * the one the UI renders on -- backboardd shows the digitizer on <main>
+     * while every SpringBoard scene sits on the paravirtual display's UUID,
+     * so touches never reach any view. Report the iPhone 11's actual panel
+     * instead: 828x1792 at 326 ppi is 64.5 x 139.6 mm.
+     */
+    {
+        const char *w = getenv("INFERNO_PVG_MM_W");
+        const char *h = getenv("INFERNO_PVG_MM_H");
+        const char *ct = getenv("INFERNO_PVG_CONN_TYPE");
+        disp_desc.sizeInMillimeters =
+            NSMakeSize(w ? atof(w) : 64.5, h ? atof(h) : 139.6);
+        if ([disp_desc respondsToSelector:@selector(setConnectionType:)]) {
+            [disp_desc setConnectionType:ct ? atoi(ct) : 0];
+        }
+    }
     disp_desc.queue = dispatch_get_main_queue();
     disp_desc.newFrameEventHandler = ^(void) {
         trace_apple_gfx_new_frame();
@@ -763,7 +1083,28 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
 
     desc.device = s->mtl;
 
-    apple_gfx_register_task_mapping_handlers(s, desc);
+    /*
+     * Two mutually exclusive memory models, and macOS 26 only works with the
+     * new one. The old one hands the framework createTask/mapMemory callbacks
+     * and lets it address guest memory through per-task VM ranges; but
+     * -[PGBaseTask writableCursorFromVirtualOffset:length:] is now four
+     * instructions ending in a call to abort() with no override anywhere in the
+     * framework, so the first guest command buffer carrying a compute pipeline
+     * state info record kills QEMU. The new model declares the guest's physical
+     * memory once and the framework resolves addresses itself. Setting both is
+     * refused outright -- "Disallowed to set both memoryMapDescriptor and any of
+     * createTask, destroyTask, mapMemory, unmapMemory or readMemory" -- so pick
+     * whichever this host understands.
+     */
+    if ([desc respondsToSelector:@selector(setMemoryMapDescriptor:)]) {
+        PGMemoryMapDescriptor *map = apple_gfx_new_guest_memory_map();
+
+        desc.memoryMapDescriptor = map;
+        [map release];
+        apple_gfx_add_writable_cursor_override();
+    } else {
+        apple_gfx_register_task_mapping_handlers(s, desc);
+    }
 
     s->cursor_show = true;
 
@@ -778,9 +1119,23 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
      * guest will ignore these displays if they share the same serial number,
      * so ensure each instance gets a unique one.
      */
-    s->pgdisp = [s->pgdev newDisplayWithDescriptor:disp_desc
-                                              port:0
-                                         serialNum:next_pgdisplay_serial_num++];
+    /*
+     * iOS derives the display's CADisplay uniqueID from this serial number, and
+     * BackBoard only prints/treats a display as `<main>` -- the built-in panel
+     * the touchscreen is filed under -- when that UUID is null. With a non-zero
+     * serial the paravirtual panel gets a freshly generated UUID every boot and
+     * the digitizer ends up on a separate `<main>` entry with no hit regions.
+     * INFERNO_PVG_SERIAL overrides it (0 = let the framework pick nothing).
+     */
+    {
+        const char *sn = getenv("INFERNO_PVG_SERIAL");
+        uint32_t serial = sn != NULL ? (uint32_t)strtoul(sn, NULL, 0) :
+                                       next_pgdisplay_serial_num;
+        next_pgdisplay_serial_num++;
+        s->pgdisp = [s->pgdev newDisplayWithDescriptor:disp_desc
+                                                  port:0
+                                             serialNum:serial];
+    }
     [disp_desc release];
 
     if (s->display_modes != NULL && s->num_display_modes > 0) {

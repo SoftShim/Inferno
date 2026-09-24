@@ -152,6 +152,7 @@ struct ApplePCIEState {
     ApplePCIEPort *ports[APCIE_MAX_PORTS];
     uint32_t chip_id;
     uint32_t msi_vector_offset;
+    Notifier machine_done;
 };
 
 void port_devices_set_power(ApplePCIEPort *port, bool power);

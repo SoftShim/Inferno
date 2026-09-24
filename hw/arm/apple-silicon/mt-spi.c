@@ -207,6 +207,37 @@ static const VMStateDescription vmstate_apple_mt_spi = {
 #define MT_SENSOR_SURFACE_WIDTH (6458) // display_width/828 * 7.8
 #define MT_SENSOR_SURFACE_HEIGHT (13977) // display_height/1792 * 7.8
 
+/*
+ * Touch tracing, enabled with INFERNO_MT_LOG=1. Injection goes through QMP
+ * `input-send-event` with `abs` axes; HMP `mouse_move` emits *relative*
+ * events which ui/input-legacy.c accumulates into the absolute axis and never
+ * resets, so HMP coordinates drift out of range. See data/touch.py.
+ */
+static int mt_log_enabled = -1;
+static inline bool mt_log_on(void)
+{
+    if (mt_log_enabled < 0) {
+        mt_log_enabled = getenv("INFERNO_MT_LOG") != NULL;
+    }
+    return mt_log_enabled != 0;
+}
+#define MT_LOG(fmt, ...)                               \
+    do {                                               \
+        if (mt_log_on()) {                             \
+            fprintf(stderr, "mt-spi: " fmt "\n",       \
+                    ##__VA_ARGS__);                    \
+        }                                              \
+    } while (0)
+
+static void apple_mt_spi_assert_irq(AppleMTSPIState *s);
+
+static uint64_t mt_xfer_count;
+static uint64_t mt_queued_count;
+static uint64_t mt_drained_count;
+
+/* Not a real stage: emit a frame reporting zero paths. */
+#define PATH_STAGE_EMPTY_FRAME (0xFF)
+
 #define PATH_STAGE_NOT_TRACKING (0)
 #define PATH_STAGE_START_IN_RANGE (1)
 #define PATH_STAGE_HOVER_IN_RANGE (2)
@@ -716,6 +747,9 @@ static void apple_mt_spi_handle_fw_packet(AppleMTSPIState *s)
             apple_mt_spi_buf_append(&buf, &packet->buf);
             apple_mt_spi_pad_ll_packet(&buf);
             apple_mt_spi_buf_push_crc16(&buf);
+            ++mt_drained_count;
+            MT_LOG("DRAIN queued=%" PRIu64 " drained=%" PRIu64,
+                   mt_queued_count, mt_drained_count);
             QTAILQ_REMOVE(&s->pending_fw, packet, next);
             g_free(packet);
             packet = NULL;
@@ -772,6 +806,58 @@ static void apple_mt_spi_handle_fw(AppleMTSPIState *s)
     }
 }
 
+/*
+ * The touchscreen comes up ~15-30 s before the paravirtual display exists
+ * (AppleMultitouchHIDService starts at t+25 s, Display 1 hotplugs at t+40 s).
+ * BackBoard therefore files this builtin digitizer under its <main> placeholder
+ * -- which ends up with `touchStreams: <nil>; hitTestRegions: <nil>` -- while
+ * the real display registers later under its own UUID and gets the hit
+ * regions but `digitizers: <nil>`. Nothing ever migrates the digitizer across,
+ * so every touch lands on a display with nothing to hit.
+ *
+ * INFERNO_MT_DELAY_MS keeps the chip unresponsive for that long so the driver
+ * attaches after the display is live. The SPI driver already retries a failed
+ * handshake ("AppleHIDTransportDeviceSPI: Couldn't talk to chip"), so being
+ * silent early is survivable.
+ */
+static int64_t mt_delay_ns_cached = -1;
+static bool mt_chip_asleep(void)
+{
+    if (mt_delay_ns_cached < 0) {
+        const char *v = getenv("INFERNO_MT_DELAY_MS");
+        mt_delay_ns_cached = v ? (int64_t)strtoll(v, NULL, 0) * 1000000 : 0;
+    }
+    if (mt_delay_ns_cached != 0 &&
+        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) < mt_delay_ns_cached) {
+        return true;
+    }
+
+    /*
+     * Holding the chip down from boot makes the driver give up for good
+     * ("Couldn't talk to chip", and then nothing is ever drained). Instead let
+     * it attach normally and knock it out for a few seconds *after* the
+     * display exists: the driver retries a lost chip, and the re-attach should
+     * re-register the digitizer against the display that is live by then
+     * rather than BackBoard's <main> placeholder.
+     */
+    {
+        static int64_t at_ns = -1, for_ns = -1;
+        int64_t now;
+
+        if (at_ns < 0) {
+            const char *a = getenv("INFERNO_MT_RESET_AT_MS");
+            const char *f = getenv("INFERNO_MT_RESET_FOR_MS");
+            at_ns = a ? (int64_t)strtoll(a, NULL, 0) * 1000000 : 0;
+            for_ns = f ? (int64_t)strtoll(f, NULL, 0) * 1000000 : 6000000000LL;
+        }
+        if (at_ns == 0) {
+            return false;
+        }
+        now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        return now >= at_ns && now < at_ns + for_ns;
+    }
+}
+
 static uint32_t apple_mt_spi_transfer(SSIPeripheral *dev, uint32_t val)
 {
     AppleMTSPIState *s;
@@ -779,8 +865,13 @@ static uint32_t apple_mt_spi_transfer(SSIPeripheral *dev, uint32_t val)
 
     s = container_of(dev, AppleMTSPIState, parent_obj);
 
+    if (mt_chip_asleep()) {
+        return 0;
+    }
+
     QEMU_LOCK_GUARD(&s->lock);
 
+    ++mt_xfer_count;
     apple_mt_spi_buf_push_byte(&s->rx, (uint8_t)val);
 
     if (apple_mt_spi_buf_read_byte(&s->rx, 0) == (LL_PACKET_PREAMBLE & 0xFF)) {
@@ -799,10 +890,67 @@ static uint32_t apple_mt_spi_transfer(SSIPeripheral *dev, uint32_t val)
         QTAILQ_EMPTY(&s->pending_fw)) {
         qemu_irq_raise(s->irq);
     } else {
-        qemu_irq_lower(s->irq);
+        apple_mt_spi_assert_irq(s);
     }
 
     return ret;
+}
+
+static int mt_edge_fix = -1;
+static inline bool mt_edge_fix_on(void)
+{
+    if (mt_edge_fix < 0) {
+        mt_edge_fix = getenv("INFERNO_MT_NO_EDGE_FIX") == NULL;
+    }
+    return mt_edge_fix != 0;
+}
+
+/*
+ * Assert the (active low) multi-touch IRQ so that every queued packet gets its
+ * own edge.
+ *
+ * Simply lowering a line that is already low produces no new edge, so a GPIO
+ * configured for falling-edge detection never re-interrupts while packets are
+ * still queued, and pending_fw then grows without bound. That is exactly why a
+ * tap worked but a drag did not: a tap is 1-3 packets and drains inside the
+ * first interrupt, while a swipe is ~18 and stalled with queued >> drained.
+ * Driving the line high for an instant first costs nothing for the
+ * level-triggered configs -- their pending bit is only cleared by the guest's
+ * ack -- and restores the edge for the edge-triggered ones.
+ */
+static void apple_mt_spi_assert_irq(AppleMTSPIState *s)
+{
+    if (mt_edge_fix_on()) {
+        qemu_irq_raise(s->irq);
+    }
+    qemu_irq_lower(s->irq);
+}
+
+static int mt_hz_cached = -1;
+static inline int mt_sample_hz(void)
+{
+    if (mt_hz_cached < 0) {
+        const char *v = getenv("INFERNO_MT_HZ");
+        mt_hz_cached = v ? atoi(v) : 60;
+        if (mt_hz_cached < 1 || mt_hz_cached > 1000) {
+            mt_hz_cached = 60;
+        }
+    }
+    return mt_hz_cached;
+}
+
+static uint16_t mt_env_u16(const char *name, uint16_t dflt)
+{
+    const char *v = getenv(name);
+    return v ? (uint16_t)atoi(v) : dflt;
+}
+
+static uint16_t apple_mt_spi_velocity(int32_t delta, uint64_t ts_delta_ns)
+{
+    uint64_t v;
+
+    v = (uint64_t)ABS(delta) * NANOSECONDS_PER_SECOND / ts_delta_ns;
+    return v > UINT16_MAX ? UINT16_MAX : (uint16_t)v;
 }
 
 static void apple_mt_spi_send_path_update(AppleMTSPIState *s, uint64_t ts,
@@ -824,20 +972,44 @@ static void apple_mt_spi_send_path_update(AppleMTSPIState *s, uint64_t ts,
 
     packet->type = LL_PACKET_LOSSLESS_OUTPUT;
     apple_mt_spi_buf_ensure_capacity(&packet->buf, 9 + 27 + 20 + 2);
+    /*
+     * A gesture that ends still leaves its path in every later frame, and
+     * backboardd then logs "range-in for pathIndex with existing contact --
+     * replacing" on the *next* touch, which inherits the stale contact's
+     * destination. Real hardware simply stops reporting the path, so the
+     * teardown ends with a frame carrying zero paths.
+     */
+    bool empty = path_stage == PATH_STAGE_EMPTY_FRAME;
+
     apple_mt_spi_push_report_hdr(&packet->buf, HID_TRANSFER_PACKET_OUTPUT,
                                  HID_REPORT_BINARY_PATH_OR_IMAGE,
-                                 HID_PACKET_STATUS_SUCCESS, s->frame, 27 + 20);
+                                 HID_PACKET_STATUS_SUCCESS, s->frame,
+                                 empty ? 27 : 27 + 20);
     apple_mt_spi_buf_push_byte(&packet->buf, s->frame);
     apple_mt_spi_buf_push_byte(&packet->buf, 28); // Header Len
     apple_mt_spi_buf_push_byte(&packet->buf, 0);
-    apple_mt_spi_buf_push_dword(&packet->buf, ts / SCALE_MS);
+    /*
+     * Report timestamp. The unit iOS expects here is unverified: we send
+     * milliseconds, but if the driver reads these as something finer, every
+     * report in a drag looks simultaneous and the moves collapse into one.
+     * INFERNO_MT_TS_DIV overrides the divisor (1 = nanoseconds, 1000 = us,
+     * 1000000 = ms, the default).
+     */
+    {
+        const char *tsdiv = getenv("INFERNO_MT_TS_DIV");
+        uint64_t div = tsdiv ? strtoull(tsdiv, NULL, 0) : (uint64_t)SCALE_MS;
+        if (div == 0) {
+            div = 1;
+        }
+        apple_mt_spi_buf_push_dword(&packet->buf, (uint32_t)(ts / div));
+    }
     apple_mt_spi_buf_push_byte(&packet->buf, 0);
     apple_mt_spi_buf_push_byte(&packet->buf, 0);
     apple_mt_spi_buf_push_byte(&packet->buf, 0);
     apple_mt_spi_buf_push_byte(&packet->buf, 0);
     apple_mt_spi_buf_push_word(&packet->buf, 0);
     apple_mt_spi_buf_push_word(&packet->buf, 0); // Image Len
-    apple_mt_spi_buf_push_byte(&packet->buf, 1); // Path Count
+    apple_mt_spi_buf_push_byte(&packet->buf, empty ? 0 : 1); // Path Count
     apple_mt_spi_buf_push_byte(&packet->buf, 20); // Path Len
     apple_mt_spi_buf_push_word(&packet->buf, 0);
     apple_mt_spi_buf_push_word(&packet->buf, 0);
@@ -848,17 +1020,36 @@ static void apple_mt_spi_send_path_update(AppleMTSPIState *s, uint64_t ts,
     apple_mt_spi_buf_push_byte(&packet->buf, 0);
 
     // Path 0
+    if (empty) {
+        goto finish;
+    }
     apple_mt_spi_buf_push_byte(&packet->buf, 1); // Path ID
     apple_mt_spi_buf_push_byte(&packet->buf, path_stage);
     apple_mt_spi_buf_push_byte(&packet->buf, 1); // Finger ID
     apple_mt_spi_buf_push_byte(&packet->buf, 1); // Hand ID
     apple_mt_spi_buf_push_word(&packet->buf, s->x);
     apple_mt_spi_buf_push_word(&packet->buf, s->y);
-    apple_mt_spi_buf_push_word(&packet->buf, ABS(x_delta) / ts_delta * 1000);
-    apple_mt_spi_buf_push_word(&packet->buf, ABS(y_delta) / ts_delta * 1000);
-    apple_mt_spi_buf_push_word(&packet->buf, 660); // rad0
-    apple_mt_spi_buf_push_word(&packet->buf,
-                               580); // rad1
+    /*
+     * Velocity, in sensor units per second. ts_delta is in nanoseconds, so the
+     * old `ABS(delta) / ts_delta * 1000` divided first and always truncated to
+     * zero (a brisk swipe moves ~274 units per 50 ms tick, and 274/5e7 == 0),
+     * meaning every path update claimed the finger was stationary. Scale up
+     * before dividing, and saturate rather than wrap the 16-bit field.
+     */
+    apple_mt_spi_buf_push_word(&packet->buf, apple_mt_spi_velocity(x_delta,
+                                                                   ts_delta));
+    apple_mt_spi_buf_push_word(&packet->buf, apple_mt_spi_velocity(y_delta,
+                                                                   ts_delta));
+    /*
+     * Contact shape. iOS switches the digitizer into pocket-rejection mode
+     * (touch mode 1, "pocketTouchesExpected") as soon as CoverSheet is up, and
+     * in that mode a contact whose ellipse does not look like a fingertip is
+     * discarded -- which would explain touches being counted at the HID layer
+     * while never reaching the UI. These are overridable so the shape can be
+     * tuned against a guest that is rejecting them.
+     */
+    apple_mt_spi_buf_push_word(&packet->buf, mt_env_u16("INFERNO_MT_RAD0", 660));
+    apple_mt_spi_buf_push_word(&packet->buf, mt_env_u16("INFERNO_MT_RAD1", 580));
     // no freaking idea if this is even remotely correct.
     // int angle = 0;
     // double deltaX = s->x - s->prev_x;
@@ -869,9 +1060,10 @@ static void apple_mt_spi_send_path_update(AppleMTSPIState *s, uint64_t ts,
     // angle = lround(deg);
     // angle = 19317;
     // angle = 90;
-    apple_mt_spi_buf_push_word(&packet->buf, 19317); // angle/orientation
     apple_mt_spi_buf_push_word(&packet->buf,
-                               100); // rad multiplier (maybe force?)
+                               mt_env_u16("INFERNO_MT_ANGLE", 19317));
+    apple_mt_spi_buf_push_word(&packet->buf,
+                               mt_env_u16("INFERNO_MT_FORCE", 100));
     // let iOS calculate the contact density by itself
     // rad0 = max(maximum_radii, rad0)
     // rad1 = max(maximum_radii, rad1)
@@ -880,6 +1072,7 @@ static void apple_mt_spi_send_path_update(AppleMTSPIState *s, uint64_t ts,
     // contactDensityByRadii = (mult * 400) / (sqr - minimum_radii)
     // apple_mt_spi_buf_push_word(&packet->buf, 150); // contact density
 
+finish:
     apple_mt_spi_buf_push_crc16(&packet->buf);
 
     if (s->frame < 0xFF) {
@@ -889,7 +1082,11 @@ static void apple_mt_spi_send_path_update(AppleMTSPIState *s, uint64_t ts,
     }
 
     QTAILQ_INSERT_TAIL(&s->pending_fw, packet, next);
-    qemu_irq_lower(s->irq);
+    ++mt_queued_count;
+    MT_LOG("QUEUE stage=%u depth_q=%" PRIu64 " drained=%" PRIu64
+           " xfers=%" PRIu64, path_stage, mt_queued_count, mt_drained_count,
+           mt_xfer_count);
+    apple_mt_spi_assert_irq(s);
 }
 
 typedef struct {
@@ -914,6 +1111,8 @@ static void apple_mt_spi_send_touch_update_bh(void *opaque)
 
     QEMU_LOCK_GUARD(&update->s->lock);
 
+    MT_LOG("path stage=%u at sensor=(%u,%u)", update->path_stage,
+           update->s->x, update->s->y);
     apple_mt_spi_send_path_update(update->s, update->ts, update->path_stage);
 
     g_free(opaque);
@@ -934,12 +1133,27 @@ static void apple_mt_spi_timer_tick(void *opaque)
     QEMU_LOCK_GUARD(&s->lock);
 
     if (s->prev_x != s->x || s->prev_y != s->y) {
-        apple_mt_spi_schedule_touch_update(s, PATH_STAGE_TOUCHING);
+        /*
+         * INFERNO_MT_MOVE_STAGE lets the stage reported for an in-progress
+         * drag be overridden. iOS acts on our stage 3 (make touch) and stage
+         * 5/7 (break/out of range) but appears to do nothing with stage 4, so
+         * this exists to test what it actually expects for motion.
+         */
+        const char *ov = getenv("INFERNO_MT_MOVE_STAGE");
+        apple_mt_spi_schedule_touch_update(
+            s, ov ? (uint8_t)atoi(ov) : PATH_STAGE_TOUCHING);
     }
 
     if (s->btn_state & MOUSE_EVENT_LBUTTON) {
+        /*
+         * Resample fast. At the original 20 Hz a 600 ms swipe moved ~110 px
+         * between reports, which is far beyond what a real digitizer ever
+         * produces (60-120 Hz) and is a plausible reason for iOS to refuse to
+         * track the contact as one moving path -- taps landed, drags never
+         * became pans.
+         */
         timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                                NANOSECONDS_PER_SECOND / 20);
+                                NANOSECONDS_PER_SECOND / mt_sample_hz());
     }
 }
 
@@ -950,6 +1164,7 @@ static void apple_mt_spi_end_timer_tick(void *opaque)
     QEMU_LOCK_GUARD(&s->lock);
 
     apple_mt_spi_schedule_touch_update(s, PATH_STAGE_OUT_OF_RANGE);
+    apple_mt_spi_schedule_touch_update(s, PATH_STAGE_EMPTY_FRAME);
 
     s->prev_ts = 0;
     s->prev_x = 0;
@@ -982,6 +1197,9 @@ static void apple_mt_spi_mouse_event(void *opaque, int dx, int dy, int dz,
                                   MT_SENSOR_SURFACE_HEIGHT);
     s->prev_btn_state = s->btn_state;
     s->btn_state = buttons_state;
+
+    MT_LOG("event raw=(%d,%d) sensor=(%u,%u) buttons=%#x", dx, dy, s->x, s->y,
+           buttons_state);
 
     if ((s->prev_btn_state & MOUSE_EVENT_LBUTTON) == 0 &&
         (s->btn_state & MOUSE_EVENT_LBUTTON) != 0) {

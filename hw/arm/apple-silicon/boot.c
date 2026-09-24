@@ -101,7 +101,11 @@ static const char *KEEP_COMP[] = {
     "i2c,s8000\0i2c,s5l8940x\0iic,soft\0$",
     "i2c,t8030\0i2c,s5l8940x\0iic,soft\0$",
     "iic,soft\0$",
+    "gpu,t8030\0$",
+    "paravirtualizedgraphics,gpu\0$",
+    "paravirtualizedgraphics,iosurface\0$",
     "iommu-mapper\0$",
+    "iommu-mapper,gfx\0$",
     "iop,ascwrap-v2\0$",
     "iop,t8030\0iop,t8015\0$",
     "iop-nub,rtbuddy-v2\0$",
@@ -169,7 +173,6 @@ static const char *REM_NAMES[] = {
     "aop-smart-cover\0$",
     "rose\0$",
     "smc-aop\0$",
-    "gfx-asc\0$",
     "amfm\0$",
     "dart-ane\0$",
     "dart-avd\0$",
@@ -182,7 +185,6 @@ static const char *REM_NAMES[] = {
     "pmp\0$",
     "stockholm\0$",
     "stockholm-spmi\0$",
-    "bluetooth-pcie\0$",
     "wlan\0$",
 #ifndef ENABLE_BASEBAND
     "baseband\0$",
@@ -264,6 +266,17 @@ static void apple_boot_process_dt_node(AppleDTNode *node, AppleDTNode *parent)
 
     if ((prop = apple_dt_get_prop(node, "compatible")) != NULL) {
         assert_nonnull(prop->data);
+        // INFERNO_NO_DISP0 drops the display pipe node so IOMobileFramebuffer
+        // has nothing to attach to. Used to hand the screen to the
+        // paravirtual GPU's own display instead of disp0.
+        if (getenv("INFERNO_NO_DISP0") != NULL &&
+            memcmp(prop->data, "disp0,t8030",
+                   MIN(prop->len, sstrlen("disp0,t8030\0$"))) == 0) {
+            assert_nonnull(parent);
+            DINFO("Removing node `disp0` (INFERNO_NO_DISP0)");
+            apple_dt_del_node(parent, node);
+            return;
+        }
         found = false;
         for (i = 0; i < ARRAY_SIZE(KEEP_COMP); i++) {
             if (memcmp(prop->data, KEEP_COMP[i],
@@ -565,7 +578,16 @@ void apple_boot_populate_dt(AppleDTNode *root, AppleBootInfo *info,
     apple_dt_set_prop_u32(child, "effective-security-mode-ap", 1);
     apple_dt_set_prop_u32(child, "security-domain", 1);
     apple_dt_set_prop_u32(child, "chip-epoch", 1);
-    // apple_dt_set_prop_u32(child, "debug-enabled", 1);
+    /*
+     * Diagnostic only (INFERNO_DEBUG_ENABLED=1): makes XNU's
+     * PE_i_can_has_debugger() true, which is what gates AppleSEPManager's SEP
+     * shmcon / trace-buffer registration in bootSEP -- i.e. the only way to see
+     * SEPOS's own diagnostics. Off by default: it changes the guest's reported
+     * security posture, which is not something to enable for normal runs.
+     */
+    if (getenv("INFERNO_DEBUG_ENABLED") != NULL) {
+        apple_dt_set_prop_u32(child, "debug-enabled", 1);
+    }
 
     // fstab os_env_type:
     // 0x01: fstab
@@ -1014,6 +1036,26 @@ MachoHeader64 *apple_boot_load_kernel(const char *filename,
         error_setg(&error_fatal, "`%s` is a `%.4s` object (expected `krnl`)",
                    filename, payload_type);
         return NULL;
+    }
+
+    /*
+     * INFERNO_DUMP_KERNEL=<path> writes the decompressed kernelcache out before
+     * it is parsed. The restore kernelcache ships as an LZFSE ("bvx2") payload
+     * inside an IM4P, and macOS's compression_tool refuses the extracted
+     * stream, so this is the practical way to get it into a disassembler --
+     * which is what you need to check whether a patcher pattern is unique.
+     */
+    {
+        const char *dump = getenv("INFERNO_DUMP_KERNEL");
+
+        if (dump != NULL) {
+            if (g_file_set_contents(dump, (const gchar *)data, len, NULL)) {
+                info_report("dumped decompressed kernel to `%s` (%u bytes)",
+                            dump, len);
+            } else {
+                warn_report("failed to dump kernel to `%s`", dump);
+            }
+        }
     }
 
     header = apple_boot_parse_macho(data, len);

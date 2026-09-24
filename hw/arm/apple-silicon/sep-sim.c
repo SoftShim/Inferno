@@ -976,15 +976,69 @@ static void apple_sep_sim_handle_keystore_msg(AppleSEPSimState *s,
         g_free(resp_buf);
         break;
     }
+    case 0x51: {
+        /*
+         * AKSIdentitySetPrimary. Reply with the compact success shape used by
+         * the other implemented keystore commands rather than echoing the
+         * request.
+         */
+        const uint32_t resp_size = KEYSTORE_IPC_HEADER_SIZE + 0x4 + 0x4;
+        uint8_t *resp_buf = g_new0(uint8_t, resp_size);
+        KeystoreIPCHeader *resp_hdr = (KeystoreIPCHeader *)resp_buf;
+        uint32_t *selector;
+
+        qemu_log_mask(LOG_GUEST_ERROR, "SEP KeyStore // Identity SetPrimary\n");
+
+        memcpy(resp_buf, msg_buf, MIN(msg->size, resp_size));
+        resp_hdr->header_body_size = KEYSTORE_IPC_HEADER_SIZE - 0x4;
+        resp_hdr->time_msecs = msg_hdr->time_msecs;
+        resp_hdr->id = msg_hdr->id;
+        resp_hdr->proc_uid = msg_hdr->proc_uid;
+        resp_hdr->audit_session_id = msg_hdr->audit_session_id;
+        memcpy(resp_hdr->ipc_digest, msg_hdr->ipc_digest,
+               sizeof(resp_hdr->ipc_digest));
+
+        selector = (uint32_t *)(resp_hdr + 1);
+        *selector = 0;
+        *(selector + 1) = 0;
+
+        apple_sep_sim_keystore_send_ipc_resp(s, msg, resp_buf, resp_size);
+        g_free(resp_buf);
+        break;
+    }
     default: {
-        qemu_log_mask(LOG_GUEST_ERROR, "SEP KeyStore // Unknown (0x%02X)\n",
+        /*
+         * Unimplemented keystore command. Echoing the request back leaves a
+         * stale payload hash and a non-zero status word, which AppleKeyStore
+         * reports as a failure (e.g. AKSIdentitySetPrimary during a restore's
+         * protected-volume creation). Reply with a well-formed success
+         * response instead: copied header, status selector 0, zeroed body.
+         */
+        uint32_t resp_size;
+        uint8_t *resp_buf;
+        KeystoreIPCHeader *resp_hdr;
+        uint32_t *selector;
+
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SEP KeyStore // Unknown (0x%02X), replying OK\n",
                       msg_code);
 
-        dma_memory_write(s->dma_as, s->ool_state[EP_KEYSTORE].out_addr, msg_buf,
-                         msg->size, MEMTXATTRS_UNSPECIFIED);
-        apple_sep_sim_send_message(s, msg->ep,
-                                   msg->tag | KEYSTORE_MSG_TAG_REPLY, msg->id,
-                                   0, (uint32_t)msg->size << 16);
+        resp_size = MAX(msg->size, KEYSTORE_IPC_HEADER_SIZE + 0x8);
+        resp_buf = g_new0(uint8_t, resp_size);
+        /*
+         * Echo the request verbatim (this preserves the negotiated IPC
+         * header version; synthesising a header here makes the kernel
+         * negotiate v0 and then reject every message), then force the
+         * status selector to success and recompute the payload hash.
+         */
+        memcpy(resp_buf, msg_buf, msg->size);
+        resp_hdr = (KeystoreIPCHeader *)resp_buf;
+
+        selector = (uint32_t *)(resp_hdr + 1);
+        *selector = 0;
+
+        apple_sep_sim_keystore_send_ipc_resp(s, msg, resp_buf, resp_size);
+        g_free(resp_buf);
         break;
     }
     }
@@ -1016,9 +1070,17 @@ static void apple_sep_sim_handle_messages(void *opaque)
                           "EP_ART_REQUESTS: Unknown opcode %d\n", sep_msg->op);
             break;
         case EP_SECURE_CREDENTIALS:
+            /*
+             * AppleCredentialManager (biometrics / passcode) is not emulated.
+             * Leaving its commands unanswered makes every request block for
+             * five seconds and wedges the installed OS during boot, so reply
+             * immediately and let the caller fail fast instead.
+             */
             qemu_log_mask(LOG_GUEST_ERROR,
-                          "EP_SECURE_CREDENTIALS: Unknown opcode %d\n",
+                          "EP_SECURE_CREDENTIALS: opcode %d, replying\n",
                           sep_msg->op);
+            apple_sep_sim_send_message(s, sep_msg->ep, sep_msg->tag,
+                                       sep_msg->op, sep_msg->param, 0);
             break;
         case EP_XART_SLAVE:
             apple_sep_sim_handle_xart_msg(s, true, sep_msg);

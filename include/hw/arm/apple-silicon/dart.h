@@ -44,4 +44,20 @@ IOMMUMemoryRegion *apple_dart_instance_iommu_mr(AppleDARTState *s,
                                                 uint32_t sid);
 AppleDARTState *apple_dart_from_node(AppleDTNode *node);
 
+/*
+ * Mirror `sid`'s translations for the first `size` bytes of its iova space into
+ * the global address space, so they are visible under HVF (which has a single
+ * EPT and therefore ignores the per-CPU address space the SEP core relies on).
+ * No-op unless HVF is in use.
+ */
+void apple_dart_set_hvf_mirror(AppleDARTState *dart, uint32_t sid,
+                               uint64_t size);
+
+/*
+ * Re-publish every mirrored stream immediately. Call this just before handing a
+ * device a message that may refer to a freshly mapped buffer; polling alone
+ * loses that race.
+ */
+void apple_dart_hvf_mirror_refresh_all(void);
+
 #endif /* HW_ARM_APPLE_SILICON_DART_H */

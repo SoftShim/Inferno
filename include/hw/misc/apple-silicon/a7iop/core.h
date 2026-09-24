@@ -57,6 +57,8 @@ AppleA7IOPMessage *apple_a7iop_recv_ap(AppleA7IOP *s);
 void apple_a7iop_send_iop(AppleA7IOP *s, AppleA7IOPMessage *msg);
 AppleA7IOPMessage *apple_a7iop_recv_iop(AppleA7IOP *s);
 void apple_a7iop_cpu_start(AppleA7IOP *s, bool wake);
+/// Mark the core idle so the next start request is honoured.
+void apple_a7iop_cpu_mark_idle(AppleA7IOP *s);
 uint32_t apple_a7iop_get_cpu_status(AppleA7IOP *s);
 void apple_a7iop_set_cpu_status(AppleA7IOP *s, uint32_t value);
 uint32_t apple_a7iop_get_cpu_ctrl(AppleA7IOP *s);

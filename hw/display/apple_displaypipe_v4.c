@@ -42,13 +42,20 @@
 #error "PNG support is required"
 #endif
 
-#if 0
-#define ADP_INFO(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
-#else
-#define ADP_INFO(fmt, ...) \
-    do {                   \
+static int adp_log_enabled = -1;
+static inline bool adp_log_on(void)
+{
+    if (adp_log_enabled < 0) {
+        adp_log_enabled = getenv("INFERNO_ADP_LOG") != NULL;
+    }
+    return adp_log_enabled != 0;
+}
+#define ADP_INFO(fmt, ...)                             \
+    do {                                               \
+        if (adp_log_on()) {                            \
+            fprintf(stderr, fmt "\n", ##__VA_ARGS__);  \
+        }                                              \
     } while (0);
-#endif
 
 /**
  * Block Bases (DisplayTarget5)
@@ -177,6 +184,7 @@ struct AppleDisplayPipeV4State {
     QemuConsole *console;
     QEMUBH *update_disp_image_bh;
     QEMUTimer *boot_splash_timer;
+    QEMUTimer *vblank_timer;
 };
 
 static const VMStateDescription vmstate_adp_v4 = {
@@ -291,6 +299,26 @@ static void adp_v4_update_irqs(AppleDisplayPipeV4State *genpipe)
 {
     qemu_set_irq(genpipe->irqs[0], (qatomic_read(&genpipe->int_enable) &
                                     qatomic_read(&genpipe->int_status)) != 0);
+}
+
+/*
+ * Real display hardware raises a periodic frame/vblank interrupt regardless of
+ * whether a host UI is attached. IOMFB's UnifiedPipeline waits on it to
+ * complete swaps ("CommandWake"), so drive it from an internal timer instead of
+ * relying on the QEMU console refresh (which never runs under `-display none`).
+ */
+#define ADP_V4_VBLANK_HZ (60)
+
+static void adp_v4_vblank_timer_cb(void *opaque)
+{
+    AppleDisplayPipeV4State *adp = opaque;
+
+    qatomic_or(&adp->int_status, R_CONTROL_INT_OUTPUT_READY_MASK);
+    adp_v4_update_irqs(adp);
+
+    timer_mod(adp->vblank_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  (NANOSECONDS_PER_SECOND / ADP_V4_VBLANK_HZ));
 }
 
 static pixman_format_code_t adp_v4_gp_fmt_to_pixman(ADPV4GenPipe *genpipe)
@@ -563,6 +591,15 @@ static void adp_v4_reg_write(void *opaque, hwaddr addr, uint64_t data,
         ADP_INFO("disp: int enable <- 0x%X", (uint32_t)data);
         qatomic_set(&adp->int_enable, (uint32_t)data);
         adp_v4_update_irqs(adp);
+        if (adp->vblank_timer != NULL) {
+            if ((uint32_t)data & R_CONTROL_INT_OUTPUT_READY_MASK) {
+                timer_mod(adp->vblank_timer,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                              (NANOSECONDS_PER_SECOND / ADP_V4_VBLANK_HZ));
+            } else {
+                timer_del(adp->vblank_timer);
+            }
+        }
         break;
     }
     case (0x4602C >> 2): {
@@ -838,6 +875,10 @@ static void adp_v4_reset_hold(Object *obj, ResetType type)
     qatomic_set(&adp->int_status, 0);
     qatomic_set(&adp->int_enable, 0);
 
+    if (adp->vblank_timer != NULL) {
+        timer_del(adp->vblank_timer);
+    }
+
     adp_v4_update_irqs(adp);
 
     adp_v4_update_disp_image_ptr(adp);
@@ -964,6 +1005,8 @@ SysBusDevice *adp_v4_from_node(AppleDTNode *node, MemoryRegion *dma_mr)
     adp->update_disp_image_bh =
         aio_bh_new_guarded(qemu_get_aio_context(), adp_v4_update_disp_bh, adp,
                            &dev->mem_reentrancy_guard);
+    adp->vblank_timer =
+        timer_new_ns(QEMU_CLOCK_VIRTUAL, adp_v4_vblank_timer_cb, adp);
 
     apple_dt_set_prop_str(node, "display-target", "DisplayTarget5");
     apple_dt_set_prop(node, "display-timing-info", sizeof(adp_v4_timing_info),

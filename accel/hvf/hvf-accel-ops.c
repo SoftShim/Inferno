@@ -48,6 +48,9 @@
  */
 
 #include "qemu/osdep.h"
+#ifdef CONFIG_DARWIN
+#include <pthread/qos.h>
+#endif
 #include "qemu/guest-random.h"
 #include "qemu/main-loop.h"
 #include "qemu/queue.h"
@@ -175,6 +178,25 @@ static void *hvf_cpu_thread_fn(void *arg)
     int r;
 
     assert(hvf_enabled());
+
+    /*
+     * This host is 6 performance + 12 efficiency cores, and macOS parks a
+     * thread on the efficiency cores unless its QoS says otherwise, and a vCPU
+     * thread running guest code is as latency-sensitive as anything in the
+     * process. Measured over 6 boots this made no difference (median 37 s vs
+     * 36 s), so it is hygiene rather than a win -- but it is a scheduling hint
+     * with no correctness implications, so it stays.
+     * INFERNO_HVF_QOS=0 leaves the default.
+     */
+#ifdef CONFIG_DARWIN
+    {
+        const char *e = getenv("INFERNO_HVF_QOS");
+
+        if (e == NULL || atoi(e) != 0) {
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        }
+    }
+#endif
 
     rcu_register_thread();
 

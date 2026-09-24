@@ -28,7 +28,7 @@ struct mac_slot {
     uint64_t gva;
 };
 
-struct mac_slot mac_slots[32];
+struct mac_slot mac_slots[HVF_NUM_SLOTS];
 
 const char *hvf_return_string(hv_return_t ret)
 {

@@ -38,6 +38,7 @@
 #include "qemu/log.h"
 #include "qemu/units.h"
 #include "system/address-spaces.h"
+#include "system/hw_accel.h"
 #include "system/block-backend-global-state.h"
 #include "system/block-backend-io.h"
 #include "system/tcg.h"
@@ -52,7 +53,8 @@
 #include <nettle/memxor.h>
 #include <nettle/version.h>
 
-#if 0
+// #define INFERNO_SEP_DEBUG 1
+#ifdef INFERNO_SEP_DEBUG
 #define HEXDUMP(a, b, c) qemu_hexdump(stderr, a, b, c)
 #define DPRINTF(v, ...) fprintf(stderr, v, ##__VA_ARGS__)
 #else
@@ -1579,6 +1581,26 @@ static void trng_regs_reg_write(void *opaque, hwaddr addr, uint64_t data,
     case REG_TRNG_CONTROL: {
         uint32_t old_enabled = (s->config & TRNG_CONTROL_ENABLED) != 0;
         s->config = (uint32_t)data;
+        /*
+         * Fill the FIFO when data is *requested*, not only when the previous
+         * batch is acknowledged via REG_TRNG_STATUS.
+         *
+         * REG_TRNG_STATUS reads unconditionally report READY|TEST_READY, so
+         * SEPROM's first request went: read STATUS (ready) -> read the FIFO ->
+         * write STATUS to ack. Nothing had filled the FIFO yet, so that first
+         * read handed SEPROM 16 zero bytes. Its continuous health tests
+         * (repetition count / stuck) reject an all-zero block and the core
+         * stops right there -- which is why nothing ever drains the SEP
+         * mailbox and the RSEP boot's opcode 2 goes unanswered.
+         *
+         * Same guard as the STATUS path: in ENCRYPT_FIFO / INIT_DRBG mode the
+         * FIFO is an input buffer SEPROM has written itself, so leave it be.
+         */
+        if ((data & TRNG_CONTROL_REQUEST_DATA) != 0 &&
+            (s->offset_0x70 &
+             (TRNG_UNKN5_ENCRYPT_FIFO | TRNG_UNKN5_INIT_DRBG)) == 0) {
+            qemu_guest_getrandom_nofail(s->fifo, sizeof(s->fifo));
+        }
         DPRINTF("TRNG_REGS: REG_TRNG_CONTROL write at 0x" HWADDR_FMT_plx
                 " of value 0x%" PRIX64 "\n",
                 addr, data);
@@ -2809,13 +2831,61 @@ static void aess_handle_cmd(AppleAESSState *s)
                 __func__, normalized_cmd, cmd);
     }
 #endif
-// TODO: other sync commands: 0x205(0x201), 0x204(0x281), 0x245(0x241),
-// 0x244(0x2C1)
-#if 0
-    else if (normalized_cmd == 0x...)
-    {
+    /*
+     * Seed-sync for the four custom key slots -- the counterpart of the 0x00 /
+     * 0x10 handlers above, which fold seed_bits into the UID0 / UID1 keywrap
+     * keys. The pairing is the one recorded in this file's own TODO:
+     *
+     *     sync 0x?05 -> key 0x?01 (slot 0)   sync 0x?45 -> key 0x?41 (slot 1)
+     *     sync 0x?04 -> key 0x?81 (slot 2)   sync 0x?44 -> key 0x?C1 (slot 3)
+     *
+     * SEPOS's sks app issues these while building its key ladder and the
+     * emulation used to drop them silently. They set no output registers,
+     * which is why they looked harmless in a register trace, so handling them
+     * is still the correct behaviour.
+     *
+     * NOT a fix for data protection, despite an earlier claim here: with this
+     * implemented, a full restore still fails identically at
+     * create_protected_filesystems, with sks returning -13 to every keystore
+     * command starting with the version negotiate. The key ladder is not what
+     * sks is unhappy about. See FIXES.md 9.5.
+     *
+     * aess_get_custom_keywrap_index() asserts on anything outside its four
+     * mapped values, so map here rather than calling it.
+     */
+    else if (normalized_cmd == 0x04 || normalized_cmd == 0x05) {
+        int slot;
+
+        switch (cmd & 0xFF) {
+        case 0x05:
+            slot = 0;
+            break;
+        case 0x45:
+            slot = 1;
+            break;
+        case 0x04:
+            slot = 2;
+            break;
+        case 0x44:
+            slot = 3;
+            break;
+        default:
+            slot = -1;
+            break;
+        }
+
+        if (slot < 0) {
+            DPRINTF("SEP AESS_BASE: %s: unmapped seed-sync slot, cmd 0x%03x\n",
+                    __func__, cmd);
+        } else {
+            xor_32bit_value(&s->custom_key_index[slot][0x8], s->seed_bits,
+                            0x8 / 4);
+            s->custom_key_index_enabled[slot] = true;
+            DPRINTF("SEP AESS_BASE: %s: seed-sync slot %d with seed_bits "
+                    "0x%X, cmd 0x%03x\n",
+                    __func__, slot, s->seed_bits, cmd);
+        }
     }
-#endif
     else {
         DPRINTF("SEP AESS_BASE: %s: Unknown command 0x%02x\n", __func__, cmd);
         // valid_command = false;
@@ -3177,7 +3247,13 @@ static uint64_t aesh_base_reg_read(void *opaque, hwaddr addr, unsigned size)
     // // from misc0: 0xC, 0xF4
     // case 0xC: // ???? bit1 clear, bit0 set ; REGISTER_INTERRUPT_STATUS
     //     return (0 << 1) | (1 << 0);
-    case 0xF4: // ????
+    case 0xF4:
+        /*
+         * Bit 0 is an *error/busy* flag, not "ready". SEPROM reads it at
+         * 0x240000c98 and `tbnz w8, #0` branches straight to `panic 0x6E`, so
+         * 0 is correct here. Returning 1 was tried and produced exactly that
+         * panic; noted so it is not re-tried.
+         */
         return 0x0;
     default:
     jump_default:
@@ -3848,6 +3924,19 @@ static void progress_reg_write(void *opaque, hwaddr addr, uint64_t data,
         break;
     case 0x0:
         memcpy(&s->progress_regs[addr], &data, size);
+        {
+            static bool once;
+            if (!once) {
+                once = true;
+                DPRINTF("SEP RUNNING: halted=%d power_state=%d stopped=%d "
+                        "cpu_ctrl=0x%x cpu_status=0x%x\n",
+                        CPU(s->cpu)->halted,
+                        (int)ARM_CPU(CPU(s->cpu))->power_state,
+                        CPU(s->cpu)->stopped,
+                        apple_a7iop_get_cpu_ctrl(APPLE_A7IOP(s)),
+                        apple_a7iop_get_cpu_status(APPLE_A7IOP(s)));
+            }
+        }
         DPRINTF("SEP Progress: Progress_0 write at 0x" HWADDR_FMT_plx
                 " with value 0x%" PRIX64 "\n",
                 addr, data);
@@ -4051,7 +4140,23 @@ static void apple_sep_cpu_moni_jump(CPUState *cpu, run_on_cpu_data data)
             load_addr);
 
     AppleA13State *acpu = container_of(arm_cpu, AppleA13State, parent_obj);
-    hwaddr pwr_dn_save = acpu->A13_CPREG_VAR_NAME(SYS_ACC_PWR_DN_SAVE);
+    hwaddr pwr_dn_save;
+
+    /*
+     * apple_sep_cpu_moni_reset_regs() rewrites the SEP core's registers --
+     * including its PC -- directly in the QEMU-side env. Under HVF that is only
+     * pushed to the hypervisor when cpu->vcpu_dirty is set (see
+     * hvf_vcpu_exec()), so without this the whole jump was silently discarded
+     * and the core just carried on executing SEPROM. The SEP core runs under
+     * HVF like every other core here, and the tcg_enabled() block below is a
+     * no-op for it.
+     *
+     * cpu_synchronize_state() pulls the live state and leaves vcpu_dirty set,
+     * which is exactly the contract the GXF helpers in target/arm/hvf/hvf.c
+     * document for anyone editing env by hand.
+     */
+    cpu_synchronize_state(cpu);
+    pwr_dn_save = acpu->A13_CPREG_VAR_NAME(SYS_ACC_PWR_DN_SAVE);
     cpu_pause(cpu);
     apple_sep_cpu_moni_reset_regs(cpu, load_addr, pwr_dn_save);
 
@@ -4062,7 +4167,20 @@ static void apple_sep_cpu_moni_jump(CPUState *cpu, run_on_cpu_data data)
         tb_flush__exclusive_or_serial();
         tlb_flush(cpu);
     }
+    /*
+     * cpu_resume() only clears stop/stopped. If the AP parked the core before
+     * asking for this jump -- which is exactly what a restore's RSEP boot does
+     * -- it is still halted and PSCI_OFF, and arm_cpu_has_work() stays false
+     * for a PSCI_OFF core, so it would never execute from load_addr. Safe to
+     * force here because this function has just set the PC itself.
+     */
+    ARM_CPU(cpu)->power_state = PSCI_ON;
+    cpu->halted = 0;
     cpu_resume(cpu);
+    if (getenv("INFERNO_SEP_PS_TRACE") != NULL) {
+        fprintf(stderr, "SEP_PS: moni_jump to 0x" HWADDR_FMT_plx "\n",
+                load_addr);
+    }
     // using qemu_irq_raise ARM_CPU_IRQ here will cause a7iop atomic sigsegv
 }
 
@@ -4071,6 +4189,15 @@ static void apple_sep_iop_start(AppleA7IOP *s)
     AppleSEPState *sep = container_of(s, AppleSEPState, parent_obj);
 
     trace_apple_sep_iop_start(s->iop_mailbox->role);
+
+    if (getenv("INFERNO_SEP_PS_TRACE") != NULL) {
+        fprintf(stderr,
+                "SEP_PS: iop_start halted=%d power_state=%d cpu_ctrl=0x%x "
+                "modern=%d\n",
+                CPU(sep->cpu)->halted,
+                (int)ARM_CPU(CPU(sep->cpu))->power_state,
+                apple_a7iop_get_cpu_ctrl(s), sep->modern);
+    }
 
     if (sep->modern) {
         async_safe_run_on_cpu(CPU(sep->cpu), apple_sep_cpu_moni_jump,
@@ -4083,6 +4210,9 @@ static void apple_sep_iop_wakeup(AppleA7IOP *s)
     AppleSEPState *sep = container_of(s, AppleSEPState, parent_obj);
 
     trace_apple_sep_iop_wakeup(s->iop_mailbox->role);
+
+    DPRINTF("%s: halted=%d power_state=%d\n", __func__, CPU(sep->cpu)->halted,
+            (int)ARM_CPU(CPU(sep->cpu))->power_state);
 
     // TODO
     qemu_log_mask(LOG_UNIMP, "%s: unimplemented", __func__);
@@ -4191,8 +4321,19 @@ AppleSEPState *apple_sep_from_node(AppleDTNode *node, MemoryRegion *ool_mr,
         unset_feature(&s->cpu->env, ARM_FEATURE_AARCH64);
         memory_region_add_subregion(&APPLE_A9(s->cpu)->memory, 0, mr0);
     }
-    if (s->chip_id >= 0x8020) {
-        // hack to make SEP_ENABLE_OVERWRITE_SHMBUF_OBJECTS work properly
+    /*
+     * Window into the SEP's shmbuf header for the AP side, for
+     * SEP_ENABLE_OVERWRITE_SHMBUF_OBJECTS.
+     *
+     * Only valid when shmbuf_base is actually known. It is assigned from
+     * SEP_SHMBUF_BASE under SEP_ENABLE_TRACE_BUFFER (and refined later from the
+     * AP's shmbuf message), so with those off it is still 0 here -- and an
+     * alias of `ool_mr` placed at system address 0 lands right on top of the
+     * "SEPFW_" RAM that backs SEP's own 0-32 MiB, turning any DART
+     * pass-through into a self-loop: system 0 -> DART -> system 0 -> ...
+     * That is what wedged the boot when DART bypass was made an identity map.
+     */
+    if (s->chip_id >= 0x8020 && s->shmbuf_base != 0) {
         MemoryRegion *mr1 = g_new0(MemoryRegion, 1);
         memory_region_init_alias(mr1, OBJECT(s), "sep_shmbuf_hdr", ool_mr,
                                  s->shmbuf_base, 0x4000);
@@ -4401,6 +4542,27 @@ static void apple_sep_cpu_reset_work(CPUState *cpu, run_on_cpu_data data)
             "\n",
             s->base);
     cpu_set_pc(cpu, s->base);
+    DPRINTF("%s: after cpu_reset: halted=%d power_state=%d fw_mapped=%d\n",
+            __func__, cpu->halted, (int)ARM_CPU(cpu)->power_state,
+            s->fw_mapped);
+    /*
+     * A reset on its own does not get the core running again: after the first
+     * boot it is parked (SEPOS ends up in WFI), and nothing re-issues the
+     * start that woke it originally. Un-halt and kick it here so a warm reset
+     * -- the restore's RSEP boot -- actually re-enters SEPROM.
+     *
+     * Deliberately do NOT touch power_state here. The AP owns that: it starts
+     * the core by writing PMGR SEP_PS (t8030.c 0x80C00) -> apple_a13_set_on(),
+     * which is gated on apple_a13_is_off(). Forcing PSCI_ON would make that
+     * write a no-op and the core would never start at all.
+     */
+    if (s->fw_mapped) {
+        cpu->halted = 0;
+        cpu_resume(cpu);
+        qemu_cpu_kick(cpu);
+        DPRINTF("%s: warm start issued: halted=%d power_state=%d\n", __func__,
+                cpu->halted, (int)ARM_CPU(cpu)->power_state);
+    }
 }
 
 static void apple_sep_realize(DeviceState *dev, Error **errp)
@@ -4489,8 +4651,29 @@ static void pka_reset(ApplePKAState *s)
 
 static void map_sepfw(AppleSEPState *s)
 {
-    DPRINTF("%s: entered function\n", __func__);
     AddressSpace *nsas = &address_space_memory;
+
+    DPRINTF("%s: entered function\n", __func__);
+
+    /*
+     * Only install the firmware handed to us on the *cold* boot.
+     *
+     * A restore reboots SEP a second time with the RSEP firmware: XNU copies
+     * that image into the `rsepfirmware` region itself
+     * (AppleSEPFirmware::_copyInData) and only then asks for the reset. Wiping
+     * 16 MiB and re-writing the `sep-fw=` image here destroys what it just
+     * placed, so SEPROM finds nothing and the kernel panics
+     * "SEP/OS failed to boot at stage 1, Firmware type: RSEP".
+     *
+     * INFERNO_SEP_REMAP_FW=1 restores the old always-remap behaviour.
+     */
+    if (s->fw_mapped && getenv("INFERNO_SEP_REMAP_FW") == NULL) {
+        DPRINTF("%s: warm reset, leaving the AP's firmware in place\n",
+                __func__);
+        return;
+    }
+    s->fw_mapped = true;
+
     // Apparently needed because of a bug occurring on XNU
     // clear lowest 0x4000 bytes as well, because they shouldn't contain any
     // valid data
@@ -4512,6 +4695,42 @@ static void apple_sep_reset_hold(Object *obj, ResetType type)
     if (sc->parent_phases.hold != NULL) {
         sc->parent_phases.hold(obj, type);
     }
+    /*
+     * This used to take a "warm" shortcut whenever the firmware had already
+     * been mapped once -- keep every register bank, just restart the core --
+     * on the theory that a restore's second (RSEP) SEP boot would otherwise
+     * find the core switched off. That theory does not survive reading the
+     * code: the RSEP boot goes through PMGR SEP_PS, which lands in
+     * apple_a13_reset()/apple_a13_set_on() and never calls this function at
+     * all. The only way here is qemu_devices_reset() from t8030_reset(), i.e.
+     * a whole-machine reset -- a guest reboot.
+     *
+     * And for a reboot the shortcut is simply wrong. Inferno boots the kernel
+     * directly, so nothing replays the two messages iBoot sends SEP before
+     * handing over (the fake GenerateNonce and INTEGRITY_TREE_SIZE at the end
+     * of this function). Skipping them left SEPROM with the previous boot's
+     * TZ0 still latched, and every reboot panicked the AP:
+     *
+     *     panic: SEP/OS failed to boot at stage 1
+     *     Firmware type: SEPI   SEP state: 5   Boot state: 1
+     *     TZ0 explicitly set 1 size 0xf000000
+     *
+     * which made every reboot-driven flow -- enabling Developer Mode, the
+     * restore reboots -- impossible. Full reset it is.
+     * INFERNO_SEP_WARM_REBOOT=1 restores the old behaviour.
+     */
+    if (s->fw_mapped && getenv("INFERNO_SEP_WARM_REBOOT") != NULL) {
+        DPRINTF("%s: warm reset, keeping the register state\n", __func__);
+        if (getenv("INFERNO_SEP_PS_TRACE") != NULL) {
+            fprintf(stderr, "SEP_PS: device warm reset\n");
+        }
+        apple_a7iop_cpu_mark_idle(APPLE_A7IOP(s));
+        run_on_cpu(CPU(s->cpu), apple_sep_cpu_reset_work,
+                   RUN_ON_CPU_HOST_PTR(s));
+        map_sepfw(s);
+        return;
+    }
+
     s->key_fcfg_offset_0x14_index = 0;
     memset(s->key_fcfg_offset_0x14_values, 0,
            sizeof(s->key_fcfg_offset_0x14_values));
@@ -4545,6 +4764,18 @@ static void apple_sep_reset_hold(Object *obj, ResetType type)
     aesh_reset(&s->aesh_state);
     pka_reset(&s->pka_state);
     // apple_ssc_reset is being called, but not here.
+    /*
+     * A warm reset has to leave the core *startable*. apple_a7iop_cpu_start()
+     * early-outs when the status says the CPU is not idle ("already awake - do
+     * nothing"), and nothing else clears that here, so after a reset the AP's
+     * next CPU_CTRL_RUN write is ignored and the core never executes SEPROM
+     * again. That is what makes a restore's second (RSEP) SEP boot sit at
+     * stage 1 forever.
+     */
+    if (s->fw_mapped) {
+        /* Warm reset only: at cold reset the mailbox is not realized yet. */
+        apple_a7iop_cpu_mark_idle(APPLE_A7IOP(s));
+    }
     run_on_cpu(CPU(s->cpu), apple_sep_cpu_reset_work, RUN_ON_CPU_HOST_PTR(s));
     map_sepfw(s);
 
@@ -4664,7 +4895,7 @@ static bool is_keyslot_valid(struct AppleSSCState *ssc_state,
     bool ret;
 
     if (kbkdf_index >= KBKDF_KEY_MAX_SLOTS) {
-        DPRINTF("%s: kbkdf_index over limit: %u\n", func, kbkdf_index);
+        DPRINTF("%s: kbkdf_index over limit: %u\n", __func__, kbkdf_index);
         ret = false;
     } else {
         ret = !buffer_is_zero(&ssc_state->ecc_keys[kbkdf_index],
@@ -4675,7 +4906,7 @@ static bool is_keyslot_valid(struct AppleSSCState *ssc_state,
 
     DPRINTF("%s: kbkdf_index: %d ; ecc_keys_item_size: 0x%lX ; "
             "kbkdf_keys_item_size: 0x%lX\n",
-            func, kbkdf_index, sizeof(struct ecc_scalar),
+            __func__, kbkdf_index, sizeof(struct ecc_scalar),
             sizeof(ssc_state->kbkdf_keys[kbkdf_index]));
     return ret;
 }

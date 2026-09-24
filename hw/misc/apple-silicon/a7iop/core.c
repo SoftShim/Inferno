@@ -45,8 +45,24 @@ AppleA7IOPMessage *apple_a7iop_recv_iop(AppleA7IOP *s)
     return apple_a7iop_mailbox_recv_iop(s->ap_mailbox);
 }
 
+static bool a7iop_trace(AppleA7IOP *s)
+{
+    return s->role != NULL && strcmp(s->role, "SEP") == 0 &&
+           getenv("INFERNO_SEP_PS_TRACE") != NULL;
+}
+
 void apple_a7iop_cpu_start(AppleA7IOP *s, bool wake)
 {
+    if (a7iop_trace(s)) {
+        fprintf(stderr,
+                "SEP_PS: cpu_start(wake=%d) ctrl=0x%x status=0x%x -> %s\n",
+                wake, apple_a7iop_get_cpu_ctrl(s),
+                apple_a7iop_get_cpu_status(s),
+                ((apple_a7iop_get_cpu_ctrl(s) & SEP_BOOT_MONITOR_RUN) == 0 &&
+                 (apple_a7iop_get_cpu_status(s) & CPU_STATUS_IDLE) == 0) ?
+                    "DROPPED (not idle)" :
+                    "start");
+    }
     // Already awake - do nothing.
     // Skip check if Secure Enclave Processor.
     if ((apple_a7iop_get_cpu_ctrl(s) & SEP_BOOT_MONITOR_RUN) == 0 &&
@@ -70,6 +86,12 @@ void apple_a7iop_cpu_start(AppleA7IOP *s, bool wake)
     }
 }
 
+void apple_a7iop_cpu_mark_idle(AppleA7IOP *s)
+{
+    QEMU_LOCK_GUARD(&s->lock);
+    s->cpu_status |= CPU_STATUS_IDLE;
+}
+
 uint32_t apple_a7iop_get_cpu_status(AppleA7IOP *s)
 {
     QEMU_LOCK_GUARD(&s->lock);
@@ -78,6 +100,10 @@ uint32_t apple_a7iop_get_cpu_status(AppleA7IOP *s)
 
 void apple_a7iop_set_cpu_status(AppleA7IOP *s, uint32_t value)
 {
+    if (a7iop_trace(s)) {
+        fprintf(stderr, "SEP_PS: set_cpu_status 0x%x (was 0x%x)\n", value,
+                apple_a7iop_get_cpu_status(s));
+    }
     QEMU_LOCK_GUARD(&s->lock);
     s->cpu_status = value;
 }
@@ -90,6 +116,11 @@ uint32_t apple_a7iop_get_cpu_ctrl(AppleA7IOP *s)
 
 void apple_a7iop_set_cpu_ctrl(AppleA7IOP *s, uint32_t value)
 {
+    if (a7iop_trace(s)) {
+        fprintf(stderr, "SEP_PS: set_cpu_ctrl 0x%x (was 0x%x) status=0x%x\n",
+                value, apple_a7iop_get_cpu_ctrl(s),
+                apple_a7iop_get_cpu_status(s));
+    }
     WITH_QEMU_LOCK_GUARD(&s->lock)
     {
         s->cpu_ctrl = value;

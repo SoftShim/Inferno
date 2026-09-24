@@ -186,6 +186,17 @@ static void apple_aic_update(AppleAICState *s)
     }
 }
 
+static bool apple_aic_tick_only(void)
+{
+    static int8_t only = -1;
+
+    if (only < 0) {
+        const char *e = getenv("INFERNO_AIC_TICK_ONLY");
+        only = (e != NULL && atoi(e) != 0) ? 1 : 0;
+    }
+    return only != 0;
+}
+
 static void apple_aic_set_irq(void *opaque, int irq, int level)
 {
     AppleAICState *s = opaque;
@@ -195,8 +206,68 @@ static void apple_aic_set_irq(void *opaque, int irq, int level)
     trace_aic_set_irq(irq, level);
     if (level) {
         set_bit32(irq, s->eir_state);
+        /*
+         * Delivery otherwise waits for the next kAICWT (64us) tick, so every
+         * interrupt carries up to 64us of latency. For a device like NVMe
+         * whose completions gate the next request that is the whole cost of
+         * guest I/O: an APFS directory walk of a few hundred thousand
+         * dependent metadata reads spends ~16 s in nothing but tick latency,
+         * which is exactly what "attrlistbulk_iterator: Spent too much time
+         * (16)s in iterating" was measuring. Run the tick now instead and let
+         * it re-arm itself; it is idempotent and takes this same mutex.
+         * INFERNO_AIC_TICK_ONLY=1 restores the old behaviour.
+         */
+        if (!apple_aic_tick_only()) {
+            timer_mod_ns(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        }
     } else {
         clear_bit32(irq, s->eir_state);
+    }
+}
+
+/*
+ * Stall detector: report any IRQ whose line has been asserted for a long time
+ * without being delivered, and say why. A stalled boot ends with the guest's
+ * NVMe driver printing a request that never completed, so the question is
+ * whether the completion interrupt was raised and then not delivered (masked,
+ * or with no destination CPU programmed) or never raised at all.
+ * INFERNO_AIC_STALL_MS=<ms> enables it.
+ */
+static void apple_aic_check_stalls(AppleAICState *s)
+{
+    static int64_t threshold_ms = -1;
+    static int64_t since[1024];
+    static bool reported[1024];
+    int64_t now;
+    int i;
+
+    if (threshold_ms < 0) {
+        const char *e = getenv("INFERNO_AIC_STALL_MS");
+        threshold_ms = e != NULL ? strtoll(e, NULL, 0) : 0;
+    }
+    if (threshold_ms == 0) {
+        return;
+    }
+
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000000;
+    for (i = 0; i < s->numIRQ && i < 1024; i++) {
+        if (!test_bit32(i, s->eir_state)) {
+            since[i] = 0;
+            reported[i] = false;
+            continue;
+        }
+        if (since[i] == 0) {
+            since[i] = now;
+            continue;
+        }
+        if (!reported[i] && now - since[i] > threshold_ms) {
+            reported[i] = true;
+            fprintf(stderr,
+                    "aic-stall: irq %d asserted %lldms undelivered "
+                    "(masked=%d dest=%#x)\n",
+                    i, (long long)(now - since[i]),
+                    test_bit32(i, s->eir_mask) ? 1 : 0, s->eir_dest[i]);
+        }
     }
 }
 
@@ -207,6 +278,7 @@ static void apple_aic_tick(void *opaque)
     QEMU_LOCK_GUARD(&s->mutex);
 
     apple_aic_update(s);
+    apple_aic_check_stalls(s);
 
     timer_mod_ns(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + kAICWT);
 }

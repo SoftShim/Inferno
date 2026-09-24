@@ -45,6 +45,7 @@
 #include "hw/gpio/apple_gpio.h"
 #include "hw/i2c/apple_i2c.h"
 #include "hw/intc/apple_aic.h"
+#include "hw/misc/apple-silicon/a7iop/rtkit.h"
 #include "hw/misc/apple-silicon/aes.h"
 #include "hw/misc/apple-silicon/aop.h"
 #include "hw/misc/apple-silicon/baseband.h"
@@ -72,6 +73,8 @@
 #include "system/reset.h"
 #include "system/runstate.h"
 #include "system/system.h"
+#include "qobject/qlist.h"
+#include "qom/qom-qobject.h"
 #include "arm-powerctl.h"
 
 #define PROP_VISIT_GETTER_SETTER(_type, _name)                               \
@@ -117,6 +120,8 @@
         return APPLE_T8030(obj)->_name;                                   \
     }
 
+// 256 MiB does not work properly with sepos 18.5; see t8030_memory_setup().
+#define T8030_TZ0_SIZE (240 * MiB)
 #define SROM_BASE (0x100000000)
 #define SROM_SIZE (512 * KiB)
 
@@ -142,6 +147,7 @@
 
 #define ANS_SIZE (0x3D24000)
 #define SIO_SIZE (0x114000)
+#define GFX_SIZE (16 * MiB)
 #define PANIC_SIZE (0x100000)
 
 #define AMCC_BASE (0x200000000)
@@ -361,7 +367,7 @@ static void t8030_load_kernelcache(AppleT8030MachineState *t8030,
     // 256 MiB doesn't seem to work properly with sepos 18.5
     // SEP's MPIDR influences stack/sp address
     // info->tz0_size = 300 * MiB;
-    info->tz0_size = 240 * MiB; // FIXME: workaround for sepos >= 16
+    info->tz0_size = T8030_TZ0_SIZE; // FIXME: workaround for sepos >= 16
 
     // for booting sepfw 26 without opcode17:
     // tz0_base must be, at least, aligned to 32 MiB
@@ -499,6 +505,15 @@ static void t8030_memory_setup(AppleT8030MachineState *t8030)
 
     t8030_rtkit_mem_setup(t8030, ca, "sio", "iop-sio-nub", SIO_SIZE);
     t8030_rtkit_mem_setup(t8030, ca, "ans", "iop-ans-nub", ANS_SIZE);
+    /*
+     * iop-gfx-nub carries `no-firmware-service`, so RTBuddy expects the GPU
+     * firmware to already sit in a carveout described by region-base /
+     * region-size. Without them RTBuddy(GFX)::_attemptFirmwareLoad() fails its
+     * REQUIRE and panics the kernel.
+     */
+    if (apple_dt_get_node(t8030->device_tree, "/arm-io/gfx-asc") != NULL) {
+        t8030_rtkit_mem_setup(t8030, ca, "gfx-asc", "iop-gfx-nub", GFX_SIZE);
+    }
 
     if (t8030->sep_rom_filename) {
         if (!g_file_get_contents(t8030->sep_rom_filename, &seprom, &fsize,
@@ -868,12 +883,26 @@ static void pmgr_reg_write(void *opaque, hwaddr addr, uint64_t data,
         sep = APPLE_SEP(object_property_get_link(OBJECT(t8030), "sep", NULL));
 
         if (sep != NULL) {
+            bool was_off = apple_a13_is_off(APPLE_A13(sep->cpu));
+            const char *what;
+
             if (data & BIT32(31)) {
+                what = "reset";
                 apple_a13_reset(APPLE_A13(sep->cpu));
             } else if (data & BIT32(10)) {
+                what = "off";
                 apple_a13_set_off(APPLE_A13(sep->cpu));
             } else {
+                what = "on";
                 apple_a13_set_on(APPLE_A13(sep->cpu));
+            }
+            if (getenv("INFERNO_SEP_PS_TRACE") != NULL) {
+                fprintf(stderr,
+                        "SEP_PS: write 0x%" PRIx64 " -> %s (was_off=%d "
+                        "now_off=%d halted=%d)\n",
+                        data, what, was_off,
+                        apple_a13_is_off(APPLE_A13(sep->cpu)),
+                        CPU(sep->cpu)->halted);
             }
         }
         break;
@@ -1845,6 +1874,336 @@ static void t8030_create_smc(AppleT8030MachineState *t8030)
     sysbus_realize_and_unref(smc, &error_fatal);
 }
 
+
+
+
+/*
+ * Apple's paravirtual GPU.
+ *
+ * macOS 14.0's AppleParavirtGPUIOGPUFamily.kext binds
+ * IONameMatch "paravirtualizedgraphics,gpu" on IOProviderClass
+ * AppleARMIODevice -- a device tree match, exactly the way AGXG12P binds
+ * "gpu,t8030" -- and its companion AppleParavirtIOSurface.kext binds
+ * "paravirtualizedgraphics,iosurface". That kext pair was built against
+ * IOGPUFamily 93, which is the same IOGPUFamily version iOS 17.0 ships, and
+ * every library it depends on (IOGPUFamily, IOMobileGraphicsFamily, IOSurface,
+ * IOAVFamily, AppleARMPlatform) is present in the iOS 17 kernelcache.
+ *
+ * Neither node exists on real t8030 hardware, so synthesise both and back them
+ * with QEMU's apple-gfx-mmio -- the same device the vmapple machine uses to
+ * give macOS guests a paravirtual GPU. AppleParavirtGPU::setupMMIO maps device
+ * memory index 0 of its provider, so each node carries exactly one reg range.
+ *
+ * The offsets sit in a large unused hole in arm-io's first range (child
+ * 0..0x100000000 maps to physical 0x200000000 and up); the interrupts are
+ * above the highest one the stock tree uses (542) and below AIC_INT_COUNT.
+ */
+#define APV_GFX_OFFSET (0x90000000)
+#define APV_GFX_SIZE (0x10000)
+#define APV_IOSFC_OFFSET (0x90010000)
+#define APV_IOSFC_SIZE (0x10000)
+#define APV_GFX_IRQ (568)
+#define APV_IOSFC_IRQ (569)
+#define APV_GFX_PHANDLE (0x200)
+#define APV_IOSFC_PHANDLE (0x201)
+#define T8030_AIC_PHANDLE (0x20)
+
+static void t8030_create_apv_node(AppleDTNode *armio, const char *name,
+                                  const char *compatible,
+                                  const char *device_type, uint64_t offset,
+                                  uint64_t size, uint32_t irq,
+                                  uint32_t phandle)
+{
+    AppleDTNode *node;
+    uint64_t reg[2];
+
+    node = apple_dt_node_new(armio, name);
+    assert_nonnull(node);
+
+    reg[0] = offset;
+    reg[1] = size;
+    apple_dt_set_prop(node, "reg", sizeof(reg), reg);
+    apple_dt_set_prop(node, "compatible", strlen(compatible) + 1, compatible);
+    // IOMobileFramebuffer's getDisplayListNumber() walks IODeviceTree:/arm-io
+    // and classifies each child by `device_type` ("display-subsystem" is the
+    // built-in panel, "ext-display-subsystem" an external one); disp0 carries
+    // "display-subsystem". Giving apv-gpu one too sounds right but is a
+    // regression: the count it returns is how many framebuffers userspace then
+    // *waits* for, and adding apv-gpu pushes `pthread_dependency_wait_np
+    // expect:` from 1 to 2 (3 with disp0) while only one ever matches, so
+    // iomfb_populate_thread times out after 30 s, CADisplay reports a bogus
+    // 16383x16383 mode with no preferred mode, and nothing composites on
+    // either display. Off unless INFERNO_PVG_DEVTYPE is set.
+    if (device_type != NULL) {
+        apple_dt_set_prop(node, "device_type", strlen(device_type) + 1,
+                          device_type);
+    }
+    apple_dt_set_prop_u32(node, "AAPL,phandle", phandle);
+    apple_dt_set_prop_u32(node, "interrupt-parent", T8030_AIC_PHANDLE);
+    apple_dt_set_prop_u32(node, "interrupts", irq);
+}
+
+/*
+ * `wifid` never loads on this machine: its launchd plist carries
+ * `_LimitLoadToDeviceTree = (wlan, marconi-wifi)` and t8030 has neither node,
+ * so `com.apple.wifi.manager` never resolves and every daemon that asks for it
+ * logs `bootstrap_look_up of WiFiManager server failed`. That gate *is*
+ * evaluated at runtime against the IODeviceTree (unlike the plist itself,
+ * which launchd reads from its prebuilt job cache), so publishing an empty
+ * node is enough to make launchd start the daemon.
+ *
+ * TRIED 2026-09-23 and the node turned out to already exist: the stock device
+ * tree carries /arm-io/apcie/pci-bridge2/wlan ("wlan-pcie,bcm4378") and
+ * driverkitd does `Realize dext com.apple.DriverKit-AppleBCMWLAN` on every
+ * boot. So the gate is satisfied and the scaffolding is in place; what is
+ * missing is a PCIe device for that dext to attach to. Wi-Fi is a driver job,
+ * not a device-tree one.
+ *
+ * Left in as a no-op that reports what it found. Opt in with
+ * INFERNO_FAKE_WLAN=1.
+ */
+static void t8030_create_wlan_stub(AppleT8030MachineState *t8030)
+{
+    AppleDTNode *armio;
+    AppleDTNode *node;
+
+    if (getenv("INFERNO_FAKE_WLAN") == NULL) {
+        return;
+    }
+
+    armio = apple_dt_get_node(t8030->device_tree, "arm-io");
+    assert_nonnull(armio);
+
+    node = apple_dt_get_node(armio, "wlan");
+    if (node != NULL) {
+        info_report("wlan: a `wlan` node already exists; wifid's device-tree "
+                    "gate is already satisfied, the missing piece is a PCIe "
+                    "device for AppleBCMWLAN to attach to");
+        return;
+    }
+
+    node = apple_dt_node_new(armio, "wlan");
+    if (node == NULL) {
+        warn_report("wlan: could not create /arm-io/wlan");
+        return;
+    }
+    apple_dt_set_prop_str(node, "compatible", "wlan,bcm4378");
+    apple_dt_set_prop_str(node, "device_type", "wlan");
+    info_report("wlan: published a stub /arm-io/wlan node for wifid");
+}
+
+static void t8030_create_apv_gfx(AppleT8030MachineState *t8030)
+{
+    AppleDTNode *armio;
+    SysBusDevice *gfx;
+
+    armio = apple_dt_get_node(t8030->device_tree, "arm-io");
+    assert_nonnull(armio);
+
+    t8030_create_apv_node(armio, "apv-gpu", "paravirtualizedgraphics,gpu",
+                          getenv("INFERNO_PVG_DEVTYPE"),
+                          APV_GFX_OFFSET, APV_GFX_SIZE, APV_GFX_IRQ,
+                          APV_GFX_PHANDLE);
+    t8030_create_apv_node(armio, "apv-iosfc",
+                          "paravirtualizedgraphics,iosurface", NULL,
+                          APV_IOSFC_OFFSET, APV_IOSFC_SIZE, APV_IOSFC_IRQ,
+                          APV_IOSFC_PHANDLE);
+
+    gfx = SYS_BUS_DEVICE(qdev_new("apple-gfx-mmio"));
+    object_property_add_child(OBJECT(t8030), "apv-gfx", OBJECT(gfx));
+    // Give the device an id so its QemuConsole can be addressed by name:
+    // the paravirtual display is a second console, and `screendump <file>
+    // apv-gfx` is the only way to see what the guest renders on it.
+    DEVICE(gfx)->id = g_strdup("apv-gfx");
+    // Advertise the guest's own panel geometry. The framework's defaults are
+    // Mac resolutions (1920x1080 and friends); the guest reads the mode list
+    // and picks nothing, so the paravirtual scanout never comes up.
+    {
+        g_autofree char *mode =
+            g_strdup_printf("%ux%u@60", t8030->disp_width, t8030->disp_height);
+        QList *modes = qlist_new();
+        qlist_append_str(modes, mode);
+        object_property_set_qobject(OBJECT(gfx), "display-modes",
+                                    QOBJECT(modes), &error_fatal);
+        qobject_unref(modes);
+    }
+    sysbus_mmio_map(gfx, 0, t8030->armio_base + APV_GFX_OFFSET);
+    sysbus_mmio_map(gfx, 1, t8030->armio_base + APV_IOSFC_OFFSET);
+    sysbus_connect_irq(gfx, 0,
+                       qdev_get_gpio_in(DEVICE(t8030->aic), APV_GFX_IRQ));
+    sysbus_connect_irq(gfx, 1,
+                       qdev_get_gpio_in(DEVICE(t8030->aic), APV_IOSFC_IRQ));
+    sysbus_realize_and_unref(gfx, &error_fatal);
+}
+
+/*
+ * The GPU's identification registers.
+ *
+ * AGXAcceleratorG12P_{A0,B0}::probe reads six words out of the sgx node's
+ * *second* register range before it will match; with that range stubbed out to
+ * read zero both personalities logged "AGXAcceleratorG12P_B0::probe fails".
+ * The range corresponds to offset 0xD00000 of the GPU's 16 MB MMIO window, so
+ * these offsets are Asahi Linux's ID_VERSION..ID_CLUSTERS and CORE_MASK_0/1
+ * minus 0xD00000. Field layout is theirs too
+ * (drivers/gpu/drm/asahi/regs.rs::get_gpu_id):
+ *
+ *   ID_VERSION  [31:24] generation, [23:16] variant, [15:8] revision
+ *   ID_COUNTS_1 [7:0] cores per cluster, [15:8] fragments per cluster
+ *   ID_COUNTS_2 [23:16] number of GPs
+ *   ID_CLUSTERS [19:12] number of clusters
+ *
+ * The defaults describe the A13's GPU: G12P (the firmware ships as
+ * armfw_g12p.im4p), revision B0 because that is the personality paired with
+ * AGXMetalA13, one cluster of four cores. Each is overridable from the
+ * environment so the encoding can be swept without a rebuild.
+ */
+#define SGX_CORE_MASK_0 (0x1500)
+#define SGX_CORE_MASK_1 (0x1514)
+#define SGX_ID_VERSION (0x4000)
+#define SGX_ID_UNK08 (0x4008)
+#define SGX_ID_COUNTS_1 (0x4010)
+#define SGX_ID_COUNTS_2 (0x4014)
+#define SGX_ID_UNK18 (0x4018)
+#define SGX_ID_CLUSTERS (0x401C)
+
+static uint32_t t8030_sgx_env_u32(const char *name, uint32_t def)
+{
+    const char *val = getenv(name);
+
+    return val != NULL ? (uint32_t)strtoul(val, NULL, 0) : def;
+}
+
+static uint64_t t8030_sgx_id_read(void *opaque, hwaddr addr, unsigned size)
+{
+    switch (addr) {
+    case SGX_CORE_MASK_0:
+        return t8030_sgx_env_u32("INFERNO_SGX_CORE_MASK_0", 0xF);
+    case SGX_CORE_MASK_1:
+        return t8030_sgx_env_u32("INFERNO_SGX_CORE_MASK_1", 0x0);
+    case SGX_ID_VERSION:
+        /* generation 3 (G12), variant 1 (P), revision 0x10 (B0) */
+        return t8030_sgx_env_u32("INFERNO_SGX_ID_VERSION", 0x03011000);
+    case SGX_ID_UNK08:
+        return t8030_sgx_env_u32("INFERNO_SGX_ID_UNK08", 0x0);
+    case SGX_ID_COUNTS_1:
+        /* four cores per cluster, four fragments per cluster */
+        return t8030_sgx_env_u32("INFERNO_SGX_ID_COUNTS_1", 0x00000404);
+    case SGX_ID_COUNTS_2:
+        return t8030_sgx_env_u32("INFERNO_SGX_ID_COUNTS_2", 0x00010000);
+    case SGX_ID_UNK18:
+        return t8030_sgx_env_u32("INFERNO_SGX_ID_UNK18", 0x0);
+    case SGX_ID_CLUSTERS:
+        /* one cluster */
+        return t8030_sgx_env_u32("INFERNO_SGX_ID_CLUSTERS", 0x00001000);
+    default:
+        return 0;
+    }
+}
+
+static void t8030_sgx_id_write(void *opaque, hwaddr addr, uint64_t data,
+                               unsigned size)
+{
+}
+
+static const MemoryRegionOps t8030_sgx_id_ops = {
+    .read = t8030_sgx_id_read,
+    .write = t8030_sgx_id_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 8,
+};
+
+/*
+ * The GPU's RTBuddy coprocessor.
+ *
+ * AGXG12P's accelerator personality matches IONameMatch "gpu,t8030" on
+ * AppleARMIODevice, which is the stock /arm-io/sgx node, so the accelerator
+ * itself has always been matchable. What gated it is
+ * AGXFirmwareKextG12PRTBuddy, which matches IOProviderClass "RTBuddyService"
+ * with IOPropertyMatch { role = GFX } -- that service only exists if
+ * /arm-io/gfx-asc and its iop-gfx-nub are present and an ASC answers at their
+ * register range. Inferno used to delete gfx-asc from the device tree, so
+ * AGXAccelerator never registered and runningboardd logged "Unable to find
+ * IOService AGXAccelerator".
+ *
+ * This brings up a bare RTKit endpoint so the firmware kext can attach. The
+ * nub is marked pre-loaded/running the way ans and sio are, so RTBuddy skips
+ * the firmware handshake and goes straight to the management rollcall.
+ */
+static const AppleRTKitOps gfx_asc_rtkit_ops = {};
+
+static void t8030_create_gfx_asc(AppleT8030MachineState *t8030)
+{
+    AppleDTNode *armio;
+    AppleDTNode *child;
+    AppleDTNode *iop_nub;
+    AppleDTProp *prop;
+    uint64_t *reg;
+    uint32_t *ints;
+    AppleRTKit *rtk;
+    SysBusDevice *sbd;
+    MemoryRegion *sgx_id;
+    uint32_t i;
+
+    armio = apple_dt_get_node(t8030->device_tree, "arm-io");
+    assert_nonnull(armio);
+    child = apple_dt_get_node(armio, "gfx-asc");
+    if (child == NULL) {
+        /* Still on the removed-devices list. */
+        return;
+    }
+    iop_nub = apple_dt_get_node(child, "iop-gfx-nub");
+    assert_nonnull(iop_nub);
+
+    prop = apple_dt_get_prop(child, "reg");
+    assert_nonnull(prop);
+    reg = (uint64_t *)prop->data;
+
+    rtk = apple_rtkit_new(NULL, "GFX", reg[1], APPLE_A7IOP_V4,
+                          &gfx_asc_rtkit_ops);
+    sbd = SYS_BUS_DEVICE(rtk);
+    object_property_add_child(OBJECT(t8030), "gfx-asc", OBJECT(rtk));
+    sysbus_mmio_map(sbd, 0, t8030->armio_base + reg[0]);
+
+    /* The second range is the ASC's autoboot doorbell; nothing reads it back. */
+    for (i = 1; i < prop->len / 16; ++i) {
+        create_unimplemented_device("gfx-asc-aux",
+                                    t8030->armio_base + reg[i * 2],
+                                    reg[i * 2 + 1]);
+    }
+
+    prop = apple_dt_get_prop(child, "interrupts");
+    assert_nonnull(prop);
+    ints = (uint32_t *)prop->data;
+    for (i = 0; i < prop->len / sizeof(uint32_t); ++i) {
+        sysbus_connect_irq(sbd, i,
+                           qdev_get_gpio_in(DEVICE(t8030->aic), ints[i]));
+    }
+
+    apple_dt_set_prop_u32(iop_nub, "pre-loaded", 1);
+    apple_dt_set_prop_u32(iop_nub, "running", 1);
+
+    sysbus_realize_and_unref(sbd, &error_fatal);
+
+    /*
+     * AGXAcceleratorG12P_B0 pokes the GPU's own register block once it
+     * attaches. There is no model for it, so back both ranges with stub
+     * memory: an unbacked access would fault the kernel instead of just
+     * logging.
+     */
+    child = apple_dt_get_node(armio, "sgx");
+    assert_nonnull(child);
+    prop = apple_dt_get_prop(child, "reg");
+    assert_nonnull(prop);
+    reg = (uint64_t *)prop->data;
+    create_unimplemented_device("sgx", t8030->armio_base + reg[0], reg[1]);
+    sgx_id = g_new0(MemoryRegion, 1);
+    memory_region_init_io(sgx_id, OBJECT(t8030), &t8030_sgx_id_ops, t8030,
+                          "sgx-id", reg[3]);
+    memory_region_add_subregion(get_system_memory(), t8030->armio_base + reg[2],
+                                sgx_id);
+}
+
 static void t8030_create_sio(AppleT8030MachineState *t8030)
 {
     uint32_t i;
@@ -2127,6 +2486,17 @@ static void t8030_create_display(AppleT8030MachineState *t8030)
 
     child = apple_dt_get_node(t8030->device_tree, "arm-io/disp0");
 
+    if (getenv("INFERNO_DISP0_DUMP_DT") && child != NULL) {
+        GHashTableIter it;
+        gpointer k, v;
+        fprintf(stderr, "DISP0DT: disp0 node properties:\n");
+        g_hash_table_iter_init(&it, child->props);
+        while (g_hash_table_iter_next(&it, &k, &v)) {
+            fprintf(stderr, "DISP0DT:   %-34s len=%u\n", (const char *)k,
+                    ((AppleDTProp *)v)->len);
+        }
+    }
+
     sbd = adp_v4_from_node(
         child, MEMORY_REGION(apple_dart_iommu_mr(dart, ldl_le_p(prop->data))));
 
@@ -2205,10 +2575,12 @@ static void t8030_create_scaler(AppleT8030MachineState *t8030)
     sysbus_realize_and_unref(sbd, &error_fatal);
 }
 
+
 static void t8030_create_sep(AppleT8030MachineState *t8030)
 {
     AppleDTNode *armio;
     AppleDTNode *child;
+    AppleDTNode *sep_nub;
     AppleSEPState *sep;
     AppleDTProp *prop;
     uint32_t *ints;
@@ -2233,7 +2605,52 @@ static void t8030_create_sep(AppleT8030MachineState *t8030)
     child = apple_dt_get_node(armio, "sep");
     assert_nonnull(child);
 
+    /*
+     * iBoot publishes these on AppleSEPManager's provider nub, which is the
+     * `arm-io/sep/iop-sep-nub` device tree node (not `arm-io/sep`). The driver
+     * reads
+     * them back in _getTzInfo() and _getRsepfirmwareInfo(). Without them the
+     * *restore-mode* SEP boot (ramrod running `seputil --restore+art`) dies
+     * with "SEP/OS failed to boot at stage 1", after logging
+     * "Can't find property tz0-size-set / tz1-size-set / rsepfirmware".
+     * The normal boot path never consults them, which is why this only shows
+     * up during a restore.
+     *
+     * TZ0 is the SEP's carve-out, which we do program (see the AMCC TZ0
+     * base/end writes in t8030_memory_setup()). TZ1 is unused on this machine,
+     * so report it as not explicitly set rather than inventing a size.
+     */
+    sep_nub = apple_dt_get_node(child, "iop-sep-nub");
+    assert_nonnull(sep_nub);
+    apple_dt_set_prop_u32(sep_nub, "tz0-size-set", 1);
+    apple_dt_set_prop_u32(sep_nub, "tz0-size", T8030_TZ0_SIZE);
+    apple_dt_set_prop_u32(sep_nub, "tz1-size-set", 0);
+    apple_dt_set_prop_u32(sep_nub, "tz1-size", 0);
+    apple_dt_set_prop_u32(sep_nub, "rsepfirmware", SEPFW_MAPPING_SIZE);
+    assert_nonnull(child);
+
     apple_dt_set_prop_u32(child, "low-power-enable", 1);
+
+    /*
+     * Which dart-sep stream the SEP is wired to decides which SID_CONFIG entry
+     * governs its DMA, and XNU programs stream 0 and stream 15 very
+     * differently (0: TRANSLATION_ENABLE with no TTBR ever installed; 15:
+     * FULL_BYPASS with BYPASS_ADDR_39_32=2). Log it under the DART trace so the
+     * two can be told apart without guessing.
+     */
+    if (getenv("INFERNO_DART_SEP_TRACE") != NULL) {
+        fprintf(stderr, "DART_SEP: sep uses dart-sep sid %u\n",
+                *(uint32_t *)prop->data);
+    }
+
+    /*
+     * The SEP reaches the AP's out-of-line buffers through this stream. Under
+     * HVF the per-CPU `sep_dma` alias below cannot do that (one EPT for every
+     * vCPU), so ask the DART to publish the stream's translations in the global
+     * address space as well. No-op under TCG.
+     */
+    apple_dart_set_hvf_mirror(dart, *(uint32_t *)prop->data,
+                              SEP_DMA_MAPPING_SIZE);
 
     sep = apple_sep_from_node(
         child,
@@ -2379,6 +2796,17 @@ static void t8030_create_mt_spi(AppleT8030MachineState *t8030)
     apple_dt_del_prop_named(child, "auth-required");
     apple_dt_set_prop_null(child, "force-supported");
     apple_dt_set_prop_null(child, "maintain-power");
+
+    if (getenv("INFERNO_MT_DUMP_DT")) {
+        GHashTableIter it;
+        gpointer k, v;
+        fprintf(stderr, "MTDT: multi-touch node properties:\n");
+        g_hash_table_iter_init(&it, child->props);
+        while (g_hash_table_iter_next(&it, &k, &v)) {
+            fprintf(stderr, "MTDT:   %-34s len=%u\n", (const char *)k,
+                    ((AppleDTProp *)v)->len);
+        }
+    }
 
     prop = apple_dt_get_prop(child, "interrupts");
     assert_nonnull(prop);
@@ -2907,6 +3335,27 @@ static void t8030_init(MachineState *machine)
     apple_dt_set_prop_u32(child, "board-id", t8030->board_id);
     apple_dt_set_prop_u32(child, "certificate-production-status", 1);
     apple_dt_set_prop_u32(child, "certificate-security-mode", 1);
+    /*
+     * Lets the guest *change* Developer Mode on this boot. AMFI reads exactly
+     * this property off /chosen at init; without it, the lockdown service's
+     * "apply the change" action panics the kernel with
+     *
+     *     "AMFI: not booted with security-mode-change-enabled"
+     *       @ConfigurationSettings.cpp:331
+     *
+     * (note the property name has no trailing "d", unlike the panic string)
+     * and Inferno boots the kernel directly, so nothing had ever set it.
+     *
+     * It has to stay off for ordinary boots, though: when the property is
+     * present AMFI *defers* its boot-time latch -- "AMFI: delaying developer
+     * mode latching..." -- and waits for userspace to apply the pending
+     * change, so Developer Mode reads back false even when the SEP's
+     * credential manager has it stored. Real iBoot sets it for exactly the one
+     * boot that follows a change request, which is what this env var models.
+     */
+    if (getenv("INFERNO_SECURITY_MODE_CHANGE") != NULL) {
+        apple_dt_set_prop_u32(child, "security-mode-change-enable", 1);
+    }
     apple_dt_set_prop_u32(child, "mix-n-match-prevention-status", 1);
     apple_dt_set_prop_u64(child, "unique-chip-id", t8030->ecid);
 
@@ -2920,6 +3369,23 @@ static void t8030_init(MachineState *machine)
     apple_dt_set_prop_str(child, "graphics-featureset-fallbacks", "");
     apple_dt_set_prop_str(child, "artwork-display-gamut", "sRGB");
     // TODO: PMP
+    /*
+     * The stock DeviceTree.n104ap says "N104"; this overrides it to "n104sim"
+     * so AppleMobileDispH12P stays on its simulator path. Putting the real
+     * value back makes the display driver take a hardware path that trips
+     * Inferno's PAC emulation and panics the boot outright:
+     *
+     *     panic: PAC failure from kernel with DA key while authing x16
+     *            at pc 0xfffffff008ea7fdc  (AppleMobileDispH12P)
+     *
+     * The override is not free, though. `sysctl hw.targettype` is this
+     * property, and launchd builds
+     * "/System/Library/LaunchDaemons/com.apple.jetsamproperties.%s.plist" from
+     * it -- the OS ships ...N104.plist, so with "n104sim" launchd finds
+     * nothing, returns early, and leaves all eight jetsam-category tables
+     * NULL. Anything that later walks one crashes pid 1. The guest therefore
+     * carries a copy of that plist named for this target type; see FIXES.md.
+     */
     apple_dt_set_prop_str(t8030->device_tree, "target-type", "n104sim");
 
     t8030_cpu_setup(t8030);
@@ -2953,6 +3419,7 @@ static void t8030_init(MachineState *machine)
     t8030_create_pcie(t8030);
     t8030_create_ans(t8030);
     t8030_create_usb(t8030);
+    t8030_create_wlan_stub(t8030);
     t8030_create_wdt(t8030);
     t8030_create_aes(t8030);
     t8030_create_spmi(t8030, "spmi0");
@@ -2965,6 +3432,7 @@ static void t8030_init(MachineState *machine)
     t8030_create_baseband(t8030);
 #endif
     t8030_create_sio(t8030);
+    t8030_create_gfx_asc(t8030);
     t8030_create_spi0(t8030);
     t8030_create_spi(t8030, 1);
     t8030_create_spi(t8030, 3);
@@ -2984,7 +3452,21 @@ static void t8030_init(MachineState *machine)
     t8030_create_roswell(t8030);
     t8030_create_lm_backlight(t8030);
     t8030_create_display_pmu(t8030);
-    t8030_create_display(t8030);
+    /*
+     * Ordering decides which QemuConsole `-display cocoa` puts in the window.
+     * disp0's pipe normally goes first so it keeps index 0 -- but with
+     * INFERNO_NO_DISP0 the guest never attaches a driver to it, so that console
+     * sits on iBoot's splash forever while iOS renders to the paravirtual
+     * display on console 1, and the window looks dead. Put the paravirtual
+     * display first in that case so the window shows the running UI.
+     */
+    if (getenv("INFERNO_NO_DISP0")) {
+        t8030_create_apv_gfx(t8030);
+        t8030_create_display(t8030);
+    } else {
+        t8030_create_display(t8030);
+        t8030_create_apv_gfx(t8030);
+    }
     t8030_create_mt_spi(t8030);
     t8030_create_aop(t8030);
     t8030_create_mca(t8030);

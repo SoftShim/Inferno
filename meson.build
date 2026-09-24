@@ -1063,7 +1063,7 @@ if get_option('attr').allowed()
 endif
 
 cocoa = dependency('appleframeworks',
-                   modules: ['Cocoa', 'CoreVideo', 'QuartzCore'],
+                   modules: ['Cocoa', 'CoreVideo', 'QuartzCore', 'Metal'],
                    required: get_option('cocoa'))
 
 vmnet = dependency('appleframeworks', modules: 'vmnet', required: get_option('vmnet'))
